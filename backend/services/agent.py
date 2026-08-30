@@ -485,6 +485,12 @@ class SkylarkBIAgent:
         prompt = {
             "user_question": query,
             "intent_plan": plan,
+            "assignment_interpretation": (
+                "In this Skylark Drones assignment, 'leadership update', 'board update', "
+                "or 'updates for leadership' means an executive BI briefing about sales pipeline, "
+                "operations, risks, and data quality. It does not mean corporate leadership changes, "
+                "board-member announcements, appointments, resignations, or governance news unless the user explicitly asks for those."
+            ),
             "computed_pipeline_metrics": pipeline_data,
             "computed_operations_metrics": ops_data,
             "computed_data_quality_metrics": dq_data,
@@ -505,7 +511,9 @@ class SkylarkBIAgent:
                         "Use short labeled bullet groups for metrics, stage breakdowns, caveats, and recommendations. "
                         "For leadership updates, do not just list metrics. Produce a board-ready decision brief with: "
                         "1) headline judgment, 2) what changed or matters, 3) risks/blockers, 4) decisions or asks for leadership, "
-                        "5) data-quality caveats. Tie pipeline and operations together when both are provided."
+                        "5) data-quality caveats. Tie pipeline and operations together when both are provided. "
+                        "Never interpret 'leadership update' or 'board update' as personnel, governance, or board-member news in this app; "
+                        "it is an executive business update over the Monday.com Work Orders and Deals data."
                     ),
                 },
                 {"role": "user", "content": json.dumps(prompt, default=str)},
