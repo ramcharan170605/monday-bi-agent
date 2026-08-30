@@ -1,9 +1,8 @@
 import json
 import logging
-import re
 from typing import Dict, Any, List, Optional
 from sqlalchemy.orm import Session
-from sqlalchemy import func, or_
+from sqlalchemy import func
 
 from backend.config import settings
 from backend.models.database import WorkOrderModel, DealModel, DataQualityIssueModel
@@ -13,275 +12,166 @@ from backend.models.schemas import AskResponse, MetricCard
 
 logger = logging.getLogger(__name__)
 
-TOOL_DEFINITIONS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "query_deals_pipeline",
-            "description": "Calculates pipeline totals, stage breakdowns, win rates, and retrieves specific deal records from Monday.com Deals board.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "sector": {"type": "string", "description": "Sector filter (e.g. Energy, Mining, Infrastructure, Telecom, Agriculture, Geospatial)"},
-                    "stage": {"type": "string", "description": "Stage filter (e.g. Won, Lost, Proposal, Qualified, Lead, Negotiation)"},
-                    "client": {"type": "string", "description": "Client name or search keyword"},
-                    "limit": {"type": "integer", "description": "Number of deal records to return (default 15)"}
-                }
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "query_flight_operations",
-            "description": "Calculates work order completion rate, contract value, operational costs, profit margins, and retrieves specific work orders from Monday.com Work Orders board.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "sector": {"type": "string", "description": "Sector filter (e.g. Energy, Mining, Infrastructure, Telecom, Agriculture, Geospatial)"},
-                    "status": {"type": "string", "description": "Status filter (e.g. Completed, In Progress, Delayed, Scheduled)"},
-                    "client": {"type": "string", "description": "Client name or keyword"},
-                    "pilot": {"type": "string", "description": "Pilot or flight lead name"},
-                    "limit": {"type": "integer", "description": "Number of work order records to return (default 15)"}
-                }
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_specific_data_quality_issues",
-            "description": "Retrieves the actual data quality issue records with item names, affected fields, severity, details, and raw values from Monday boards.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "severity": {"type": "string", "description": "Filter by severity (HIGH, MEDIUM, LOW)"},
-                    "issue_type": {"type": "string", "description": "Filter by type (e.g. MISSING_DATE, INVALID_AMOUNT, MISSING_CLIENT, MISSING_STATUS, UNASSIGNED_PILOT)"},
-                    "board_type": {"type": "string", "description": "Filter by board (work_orders, deals)"},
-                    "limit": {"type": "integer", "description": "Max records to return (default 25)"}
-                }
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "search_records",
-            "description": "Searches across deals and work orders by keyword, client, pilot, or project title.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "Keyword to search for across all fields"}
-                },
-                "required": ["query"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_company_overview",
-            "description": "Fetches cross-board summary combining pipeline metrics, operations velocity, margins, and data hygiene scores.",
-            "parameters": {
-                "type": "object",
-                "properties": {}
-            }
-        }
-    }
-]
-
 class SkylarkBIAgent:
     def __init__(self):
         self.groq_api_key = settings.GROQ_API_KEY
         self.model = settings.GROQ_MODEL
 
-    def execute_tool(self, db: Session, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
-        """Executes analytical SQL queries against Neon PostgreSQL database."""
-        if name == "query_deals_pipeline":
-            sector = args.get("sector")
-            stage = args.get("stage")
-            client = args.get("client")
-            limit = args.get("limit", 15)
+    def _build_comprehensive_database_context(self, db: Session) -> Dict[str, Any]:
+        """Extracts complete live state from Neon PostgreSQL analytical cache."""
+        deals = db.query(DealModel).all()
+        wos = db.query(WorkOrderModel).all()
+        dqs = db.query(DataQualityIssueModel).limit(40).all()
 
-            q = db.query(DealModel)
-            if sector:
-                q = q.filter(DealModel.normalized_sector.ilike(f"%{sector}%"))
-            if stage:
-                q = q.filter(DealModel.normalized_stage.ilike(f"%{stage}%"))
-            if client:
-                q = q.filter(DealModel.client_name.ilike(f"%{client}%"))
+        # 1. Pipeline aggregations by sector and stage
+        deals_by_sector: Dict[str, Dict[str, Any]] = {}
+        for d in deals:
+            sec = d.normalized_sector or "Unassigned"
+            stg = d.normalized_stage or "Unknown"
+            val = float(d.deal_value or 0)
+            w_val = float(d.weighted_value or 0)
 
-            deals = q.all()
-            total_val = sum(float(d.deal_value or 0) for d in deals)
-            weighted_val = sum(float(d.weighted_value or 0) for d in deals)
-            won_deals = [d for d in deals if d.normalized_stage == "Won"]
-            lost_deals = [d for d in deals if d.normalized_stage == "Lost"]
+            if sec not in deals_by_sector:
+                deals_by_sector[sec] = {
+                    "total_deals": 0,
+                    "total_value": 0.0,
+                    "weighted_value": 0.0,
+                    "won_value": 0.0,
+                    "lost_value": 0.0,
+                    "won_count": 0,
+                    "lost_count": 0,
+                    "stages": {},
+                    "sample_deals": []
+                }
+            deals_by_sector[sec]["total_deals"] += 1
+            deals_by_sector[sec]["total_value"] += val
+            deals_by_sector[sec]["weighted_value"] += w_val
 
-            won_val = sum(float(d.deal_value or 0) for d in won_deals)
-            lost_val = sum(float(d.deal_value or 0) for d in lost_deals)
-            closed_val = won_val + lost_val
-            win_rate = round((won_val / closed_val * 100), 1) if closed_val > 0 else 0.0
+            if stg not in deals_by_sector[sec]["stages"]:
+                deals_by_sector[sec]["stages"][stg] = {"count": 0, "value": 0.0}
+            deals_by_sector[sec]["stages"][stg]["count"] += 1
+            deals_by_sector[sec]["stages"][stg]["value"] += val
 
-            stages = {}
-            for d in deals:
-                stg = d.normalized_stage or "Unknown"
-                if stg not in stages:
-                    stages[stg] = {"count": 0, "value": 0.0}
-                stages[stg]["count"] += 1
-                stages[stg]["value"] += float(d.deal_value or 0)
+            if stg == "Won":
+                deals_by_sector[sec]["won_value"] += val
+                deals_by_sector[sec]["won_count"] += 1
+            elif stg == "Lost":
+                deals_by_sector[sec]["lost_value"] += val
+                deals_by_sector[sec]["lost_count"] += 1
 
-            return {
-                "total_deals": len(deals),
-                "total_pipeline_value": total_val,
-                "weighted_pipeline_value": weighted_val,
-                "won_value": won_val,
-                "won_count": len(won_deals),
-                "lost_value": lost_val,
-                "lost_count": len(lost_deals),
-                "win_rate_percent": win_rate,
-                "stages": stages,
-                "deals_sample": [
-                    {
-                        "deal_name": d.deal_name,
-                        "client": d.client_name,
-                        "value": float(d.deal_value or 0),
-                        "stage": d.normalized_stage,
-                        "sector": d.normalized_sector,
-                        "owner": d.deal_owner,
-                        "expected_close": str(d.expected_close_date) if d.expected_close_date else None
-                    } for d in deals[:limit]
-                ]
-            }
+            if len(deals_by_sector[sec]["sample_deals"]) < 8:
+                deals_by_sector[sec]["sample_deals"].append({
+                    "deal_name": d.deal_name,
+                    "client": d.client_name,
+                    "value": val,
+                    "stage": stg,
+                    "probability": d.probability,
+                    "expected_close": str(d.expected_close_date) if d.expected_close_date else None
+                })
 
-        elif name == "query_flight_operations":
-            sector = args.get("sector")
-            status = args.get("status")
-            client = args.get("client")
-            pilot = args.get("pilot")
-            limit = args.get("limit", 15)
+        # 2. Operations aggregations by sector and status
+        ops_by_sector: Dict[str, Dict[str, Any]] = {}
+        for w in wos:
+            sec = w.normalized_sector or "Unassigned"
+            status = w.normalized_status or "Unknown"
+            c_val = float(w.contract_value or 0)
+            cost = float(w.actual_cost or 0)
 
-            q = db.query(WorkOrderModel)
-            if sector:
-                q = q.filter(WorkOrderModel.normalized_sector.ilike(f"%{sector}%"))
-            if status:
-                q = q.filter(WorkOrderModel.normalized_status.ilike(f"%{status}%"))
-            if client:
-                q = q.filter(WorkOrderModel.client_name.ilike(f"%{client}%"))
-            if pilot:
-                q = q.filter(WorkOrderModel.assigned_pilot_or_lead.ilike(f"%{pilot}%"))
+            if sec not in ops_by_sector:
+                ops_by_sector[sec] = {
+                    "total_work_orders": 0,
+                    "total_contract_value": 0.0,
+                    "total_actual_cost": 0.0,
+                    "completed_count": 0,
+                    "delayed_count": 0,
+                    "in_progress_count": 0,
+                    "scheduled_count": 0,
+                    "sample_missions": []
+                }
+            ops_by_sector[sec]["total_work_orders"] += 1
+            ops_by_sector[sec]["total_contract_value"] += max(0.0, c_val)
+            ops_by_sector[sec]["total_actual_cost"] += max(0.0, cost)
 
-            orders = q.all()
-            total_contract = sum(float(w.contract_value or 0) for w in orders if (w.contract_value or 0) > 0)
-            total_cost = sum(float(w.actual_cost or 0) for w in orders if (w.actual_cost or 0) > 0)
-            gross_profit = total_contract - total_cost
-            gross_margin = round((gross_profit / total_contract * 100), 1) if total_contract > 0 else 0.0
+            if status == "Completed":
+                ops_by_sector[sec]["completed_count"] += 1
+            elif status == "Delayed":
+                ops_by_sector[sec]["delayed_count"] += 1
+            elif status == "In Progress":
+                ops_by_sector[sec]["in_progress_count"] += 1
+            elif status == "Scheduled":
+                ops_by_sector[sec]["scheduled_count"] += 1
 
-            completed = [w for w in orders if w.normalized_status == "Completed"]
-            delayed = [w for w in orders if w.normalized_status == "Delayed"]
-            in_progress = [w for w in orders if w.normalized_status == "In Progress"]
-            scheduled = [w for w in orders if w.normalized_status == "Scheduled"]
+            if len(ops_by_sector[sec]["sample_missions"]) < 8:
+                ops_by_sector[sec]["sample_missions"].append({
+                    "wo_no": w.work_order_no,
+                    "client": w.client_name,
+                    "project": w.project_name,
+                    "status": status,
+                    "contract_value": c_val,
+                    "cost": cost,
+                    "pilot": w.assigned_pilot_or_lead,
+                    "due_date": str(w.due_date) if w.due_date else None
+                })
 
-            active_total = len(completed) + len(delayed) + len(in_progress) + len(scheduled)
-            comp_rate = round((len(completed) / active_total * 100), 1) if active_total > 0 else 0.0
+        # 3. Overall KPI totals
+        total_pipeline = sum(d["total_value"] for d in deals_by_sector.values())
+        weighted_pipeline = sum(d["weighted_value"] for d in deals_by_sector.values())
+        total_won = sum(d["won_value"] for d in deals_by_sector.values())
+        total_lost = sum(d["lost_value"] for d in deals_by_sector.values())
+        closed_total = total_won + total_lost
+        overall_win_rate = round((total_won / closed_total * 100), 1) if closed_total > 0 else 0.0
 
-            return {
-                "total_work_orders": len(orders),
-                "total_contract_value": total_contract,
-                "total_actual_cost": total_cost,
+        total_contracts = sum(o["total_contract_value"] for o in ops_by_sector.values())
+        total_costs = sum(o["total_actual_cost"] for o in ops_by_sector.values())
+        gross_profit = total_contracts - total_costs
+        overall_gross_margin = round((gross_profit / total_contracts * 100), 1) if total_contracts > 0 else 0.0
+
+        total_wos = len(wos)
+        total_completed = sum(o["completed_count"] for o in ops_by_sector.values())
+        total_delayed = sum(o["delayed_count"] for o in ops_by_sector.values())
+        overall_comp_rate = round((total_completed / total_wos * 100), 1) if total_wos > 0 else 0.0
+
+        # 4. Data Quality
+        dq_summary = data_quality_service.get_data_quality_summary(db)
+        sample_issues = [
+            {
+                "item": iss.item_name,
+                "board": iss.board_type,
+                "field": iss.field_name,
+                "type": iss.issue_type,
+                "severity": iss.severity,
+                "details": iss.details,
+                "raw": iss.raw_value
+            } for iss in dqs
+        ]
+
+        return {
+            "company_kpis": {
+                "total_pipeline_value": total_pipeline,
+                "weighted_pipeline_value": weighted_pipeline,
+                "total_deals_count": len(deals),
+                "total_won_value": total_won,
+                "total_lost_value": total_lost,
+                "overall_win_rate_percent": overall_win_rate,
+                "total_work_orders_count": total_wos,
+                "total_contract_value": total_contracts,
+                "total_actual_cost": total_costs,
                 "gross_profit": gross_profit,
-                "gross_margin_percent": gross_margin,
-                "completion_rate_percent": comp_rate,
-                "completed_count": len(completed),
-                "delayed_count": len(delayed),
-                "in_progress_count": len(in_progress),
-                "scheduled_count": len(scheduled),
-                "work_orders_sample": [
-                    {
-                        "work_order_no": w.work_order_no,
-                        "client": w.client_name,
-                        "project": w.project_name,
-                        "status": w.normalized_status,
-                        "contract_value": float(w.contract_value or 0),
-                        "actual_cost": float(w.actual_cost or 0),
-                        "pilot": w.assigned_pilot_or_lead,
-                        "location": w.location,
-                        "due_date": str(w.due_date) if w.due_date else None
-                    } for w in orders[:limit]
-                ]
+                "overall_gross_margin_percent": overall_gross_margin,
+                "overall_completion_rate_percent": overall_comp_rate,
+                "total_completed_missions": total_completed,
+                "total_delayed_missions": total_delayed,
+                "data_hygiene_score": dq_summary["data_hygiene_score"],
+                "total_issues_count": dq_summary["total_issues"],
+                "high_severity_issues_count": dq_summary["high_severity_count"]
+            },
+            "deals_by_sector": deals_by_sector,
+            "operations_by_sector": ops_by_sector,
+            "data_quality_audit": {
+                "summary": dq_summary,
+                "sample_flagged_records": sample_issues
             }
-
-        elif name == "get_specific_data_quality_issues":
-            severity = args.get("severity")
-            issue_type = args.get("issue_type")
-            board_type = args.get("board_type")
-            limit = args.get("limit", 25)
-
-            q = db.query(DataQualityIssueModel)
-            if severity:
-                q = q.filter(DataQualityIssueModel.severity.ilike(severity))
-            if issue_type:
-                q = q.filter(DataQualityIssueModel.issue_type.ilike(f"%{issue_type}%"))
-            if board_type:
-                q = q.filter(DataQualityIssueModel.board_type.ilike(f"%{board_type}%"))
-
-            issues = q.limit(limit).all()
-            total_count = db.query(DataQualityIssueModel).count()
-            high_count = db.query(DataQualityIssueModel).filter(DataQualityIssueModel.severity == "HIGH").count()
-
-            return {
-                "total_issues_in_database": total_count,
-                "high_severity_total": high_count,
-                "filtered_count": len(issues),
-                "specific_issues": [
-                    {
-                        "item_name": iss.item_name,
-                        "board": iss.board_type,
-                        "field": iss.field_name,
-                        "issue_type": iss.issue_type,
-                        "severity": iss.severity,
-                        "details": iss.details,
-                        "raw_value": iss.raw_value
-                    } for iss in issues
-                ]
-            }
-
-        elif name == "search_records":
-            term = args.get("query", "")
-            deals = db.query(DealModel).filter(
-                or_(
-                    DealModel.deal_name.ilike(f"%{term}%"),
-                    DealModel.client_name.ilike(f"%{term}%"),
-                    DealModel.deal_owner.ilike(f"%{term}%")
-                )
-            ).limit(10).all()
-
-            orders = db.query(WorkOrderModel).filter(
-                or_(
-                    WorkOrderModel.work_order_no.ilike(f"%{term}%"),
-                    WorkOrderModel.client_name.ilike(f"%{term}%"),
-                    WorkOrderModel.project_name.ilike(f"%{term}%"),
-                    WorkOrderModel.assigned_pilot_or_lead.ilike(f"%{term}%")
-                )
-            ).limit(10).all()
-
-            return {
-                "matched_deals": [{"name": d.deal_name, "client": d.client_name, "value": d.deal_value, "stage": d.normalized_stage} for d in deals],
-                "matched_work_orders": [{"no": w.work_order_no, "client": w.client_name, "project": w.project_name, "status": w.normalized_status, "pilot": w.assigned_pilot_or_lead} for w in orders]
-            }
-
-        elif name == "get_company_overview":
-            p = analytics_engine.get_pipeline_metrics(db)
-            ops = analytics_engine.get_operations_metrics(db)
-            dq = data_quality_service.get_data_quality_summary(db)
-            caveats = data_quality_service.generate_contextual_caveats(db)
-            return {
-                "pipeline": p,
-                "operations": ops,
-                "data_quality": dq,
-                "caveats": caveats
-            }
-
-        return {}
+        }
 
     async def answer_query(
         self,
@@ -291,29 +181,38 @@ class SkylarkBIAgent:
         history: Optional[List[Dict[str, Any]]] = None,
     ) -> AskResponse:
         """
-        Pure Conversational LLM reasoning with live Monday.com & Neon DB tool execution.
-        Zero static metric card enforcement.
+        Direct, unrestricted LLM intelligence over live Monday.com & Neon PostgreSQL database state.
+        Zero rigid tool-call failure modes. Zero static templates.
         """
-        tools_used = []
-        executed_data: Dict[str, Any] = {}
+        context = self._build_comprehensive_database_context(db)
+        answer = None
 
         if self.groq_api_key and self.groq_api_key.strip() and not self.groq_api_key.startswith("gsk_your"):
             try:
                 from groq import AsyncGroq
                 client = AsyncGroq(api_key=self.groq_api_key)
 
-                system_prompt = (
-                    "You are the Lead Business Intelligence AI Partner for Skylark Drones, speaking directly with founders and leadership.\n\n"
-                    "INSTRUCTIONS:\n"
-                    "1. Respond conversationally, naturally, and with high intelligence like a top-tier management consultant / data partner.\n"
-                    "2. When answering business questions, call the relevant database tools to fetch exact, real-time data from Monday.com / Neon DB.\n"
-                    "3. When the user asks for specifics, drill-downs, or examples (e.g. specific data quality issues, delayed flights, top deals), invoke the specific tools and name actual records, clients, projects, fields, and values from the data!\n"
-                    "4. Do NOT output raw JSON keys, curly braces, or code blocks in your final text. Write natural, beautifully formatted GitHub markdown.\n"
-                    "5. Never hallucinate imaginary data; ground all numbers, names, and specifics strictly in the tool query results."
-                )
+                system_prompt = """You are the Lead Business Intelligence AI Partner for Skylark Drones, communicating directly with company founders and executives.
+
+You have direct, real-time access to the entire analytical database synchronized from Monday.com (Deals Funnel and Flight Work Orders boards).
+
+GUIDELINES FOR ANSWERING:
+1. Speak naturally, articulately, and conversationally like a world-class VP of Strategy / Chief Data Officer.
+2. Address the user's specific question directly with high analytical precision:
+   - If they ask about a sector (e.g. "renewables" or "energy" or "mining"), drill into that sector's pipeline volume, weighted value, win rate, stage distribution, and specific customer accounts/deal names from the data.
+   - If they ask about work orders, delivery completion, or costs, break down the flight operations, gross margins, pilot coverage, and delayed missions.
+   - If they ask for specifics on data quality or caveats, name actual flagged records, corrupted fields, and operational discrepancies.
+   - If they ask for a leadership update, synthesize top commercial wins, flight execution velocity, key bottlenecks, and data hygiene notes.
+   - For greetings or conversational questions, respond warmly and helpfully.
+3. Formatting:
+   - Use clean, elegant GitHub markdown with clear section headers and concise bullet points.
+   - NEVER output raw JSON or code blocks. Always output pure, articulate markdown text.
+4. Accuracy:
+   - All numbers, values, customer names, and project references must come strictly from the provided database context."""
 
                 messages = [{"role": "system", "content": system_prompt}]
 
+                # Include recent conversation turns
                 if history:
                     for turn in history[-6:]:
                         if turn.get("type") == "user":
@@ -321,157 +220,103 @@ class SkylarkBIAgent:
                         elif turn.get("type") == "agent":
                             messages.append({"role": "assistant", "content": turn.get("text", "")})
 
-                messages.append({"role": "user", "content": query})
+                # Inject query + comprehensive live database state
+                user_message = {
+                    "question": query,
+                    "live_database_state": context
+                }
 
-                # Step 1: Initial call with tools
-                step1_resp = await client.chat.completions.create(
+                messages.append({"role": "user", "content": json.dumps(user_message, default=str)})
+
+                response = await client.chat.completions.create(
                     messages=messages,
                     model=self.model,
-                    tools=TOOL_DEFINITIONS,
-                    tool_choice="auto",
-                    temperature=0.2
+                    temperature=0.2,
+                    max_tokens=1800
                 )
-
-                choice = step1_resp.choices[0]
-
-                # Step 2: If model calls tools, execute them against Neon DB
-                if choice.message.tool_calls:
-                    messages.append(choice.message)
-
-                    for tool_call in choice.message.tool_calls:
-                        t_name = tool_call.function.name
-                        try:
-                            t_args = json.loads(tool_call.function.arguments or "{}")
-                        except:
-                            t_args = {}
-
-                        tools_used.append(t_name)
-                        t_result = self.execute_tool(db, t_name, t_args)
-                        executed_data[t_name] = t_result
-
-                        messages.append({
-                            "role": "tool",
-                            "tool_call_id": tool_call.id,
-                            "content": json.dumps(t_result, default=str)
-                        })
-
-                    # Step 3: Synthesis call
-                    step2_resp = await client.chat.completions.create(
-                        messages=messages,
-                        model=self.model,
-                        temperature=0.2,
-                        max_tokens=1500
-                    )
-                    final_answer = step2_resp.choices[0].message.content or ""
-
-                    # Extract clean text if model wrapped in JSON
-                    if final_answer.strip().startswith("{") and '"answer":' in final_answer:
-                        try:
-                            parsed = json.loads(final_answer.strip())
-                            final_answer = parsed.get("answer", final_answer)
-                        except:
-                            pass
-
-                    return AskResponse(
-                        answer=final_answer,
-                        executive_summary="Insights generated from live Monday.com database in Neon PostgreSQL.",
-                        metrics=[],  # Zero forced cards! Pure natural conversation.
-                        data_quality_caveats=[],
-                        assumptions_made=[],
-                        recommended_actions=[],
-                        tools_used=tools_used,
-                        raw_data_summary=executed_data
-                    )
-
-                else:
-                    # Conversational / greeting message without tools
-                    final_answer = choice.message.content or ""
-                    if final_answer.strip().startswith("{") and '"answer":' in final_answer:
-                        try:
-                            parsed = json.loads(final_answer.strip())
-                            final_answer = parsed.get("answer", final_answer)
-                        except:
-                            pass
-
-                    return AskResponse(
-                        answer=final_answer,
-                        executive_summary="Skylark Drones Business Intelligence Assistant.",
-                        metrics=[],
-                        data_quality_caveats=[],
-                        assumptions_made=[],
-                        recommended_actions=[],
-                        tools_used=["conversational_agent"],
-                        raw_data_summary={"intent": "conversational"}
-                    )
+                answer = response.choices[0].message.content or ""
 
             except Exception as e:
-                logger.error(f"Groq LLM tool execution failed: {e}")
+                logger.error(f"Groq LLM call failed: {e}")
 
-        # Fallback if Groq API key is missing
-        return self._direct_natural_fallback(query, db)
-
-    def _direct_natural_fallback(self, query: str, db: Session) -> AskResponse:
-        overview = self.execute_tool(db, "get_company_overview", {})
-        p = overview.get("pipeline", {})
-        ops = overview.get("operations", {})
-        dq = overview.get("data_quality", {})
-        q_lower = query.lower()
-
-        if any(w in q_lower for w in ["hey", "hello", "hi", "dude", "help"]):
-            return AskResponse(
-                answer=(
-                    "👋 **Hello! I am your Skylark Drones Business Intelligence Agent.**\n\n"
-                    "I am connected directly to our live **Monday.com Work Orders** and **Deals** boards stored in Neon PostgreSQL.\n\n"
-                    "Feel free to ask me anything about our sales pipeline, flight execution backlog, gross profit margins, or data quality caveats."
-                ),
-                executive_summary="Ready to assist with business intelligence questions.",
-                metrics=[],
-                data_quality_caveats=[],
-                assumptions_made=[],
-                recommended_actions=[],
-                tools_used=["database_connection"],
-                raw_data_summary={"intent": "conversational"}
-            )
-
-        if "quality" in q_lower or "caveat" in q_lower or "issue" in q_lower:
-            sample_issues = self.execute_tool(db, "get_specific_data_quality_issues", {"limit": 5})
-            issues_list = sample_issues.get("specific_issues", [])
-            lines = []
-            for iss in issues_list:
-                lines.append(f"- **{iss['item_name']}** ({iss['board']}): {iss['details']} [Field: `{iss['field']}`, Raw: `{iss['raw_value']}`]")
-            issues_md = "\n".join(lines) if lines else "No specific issues."
-
-            return AskResponse(
-                answer=(
-                    f"### 🛡️ Data Quality Analysis Across Monday.com Boards\n\n"
-                    f"Our overall data hygiene score is **{dq.get('data_hygiene_score', 94.9)}%** with **{dq.get('total_issues', 548)}** tracked quality items.\n\n"
-                    f"#### Examples of Specific Identified Issues:\n"
-                    f"{issues_md}\n\n"
-                    f"High severity issues primarily involve invalid numeric formats or missing client identifiers."
-                ),
-                executive_summary=f"Data hygiene score: {dq.get('data_hygiene_score', 94.9)}% with {dq.get('total_issues', 548)} issues.",
-                metrics=[],
-                data_quality_caveats=[],
-                assumptions_made=[],
-                recommended_actions=[],
-                tools_used=["get_specific_data_quality_issues"],
-                raw_data_summary=sample_issues
-            )
+        # Intelligent natural fallback if LLM is unavailable
+        if not answer:
+            answer = self._generate_intelligent_direct_answer(query, context)
 
         return AskResponse(
-            answer=(
-                f"### 📊 Business Intelligence Analysis\n\n"
-                f"- **Commercial Pipeline:** **${p.get('total_pipeline_value', 0):,.0f}** total volume across {p.get('total_deals', 0)} opportunities with a **{p.get('win_rate_percent', 0)}%** win rate.\n"
-                f"- **Flight Operations:** **{ops.get('total_work_orders', 0)}** missions tracked with a **{ops.get('completion_rate_percent', 0)}%** completion rate and **{ops.get('gross_margin_percent', 0)}%** gross operating margin.\n"
-                f"- **Data Hygiene:** **{dq.get('data_hygiene_score', 0)}%** score across {dq.get('total_issues', 0)} logged caveats."
-            ),
-            executive_summary=f"Pipeline: ${p.get('total_pipeline_value', 0):,.0f} | Operations: {ops.get('completion_rate_percent', 0)}% completion.",
-            metrics=[],
+            answer=answer,
+            executive_summary="Direct analytical intelligence over live Monday.com database in Neon PostgreSQL.",
+            metrics=[],  # Zero forced metric cards
             data_quality_caveats=[],
             assumptions_made=[],
             recommended_actions=[],
-            tools_used=["get_company_overview"],
-            raw_data_summary=overview
+            tools_used=["neon_database_direct_intelligence"],
+            raw_data_summary={"database_kpis": context["company_kpis"]}
         )
+
+    def _generate_intelligent_direct_answer(self, query: str, context: Dict[str, Any]) -> str:
+        q_lower = query.lower()
+        kpis = context["company_kpis"]
+        deals_by_sec = context["deals_by_sector"]
+        ops_by_sec = context["operations_by_sector"]
+
+        # Check for sector match (e.g. renewables, energy, solar, wind)
+        target_sec = None
+        for sec in deals_by_sec.keys():
+            if sec.lower() in q_lower or (sec.lower() == "energy" and any(w in q_lower for w in ["renewable", "solar", "wind", "power", "energy"])):
+                target_sec = sec
+                break
+
+        if target_sec and target_sec in deals_by_sec:
+            d_sec = deals_by_sec[target_sec]
+            stages_list = [f"- **{stg}:** {info['count']} deals (${info['value']:,.0f})" for stg, info in d_sec["stages"].items()]
+            sample_list = [f"- **{s['deal_name']}** ({s['client']}): ${s['value']:,.0f} — *Stage: {s['stage']}*" for s in d_sec["sample_deals"][:5]]
+
+            return f"""### ⚡ {target_sec} / Renewables Sector Pipeline Analysis
+
+Our **{target_sec}** pipeline represents a significant commercial opportunity across **{d_sec['total_deals']}** tracked deals:
+
+- **Total Pipeline Volume:** **${d_sec['total_value']:,.0f}**
+- **Probability-Weighted Value:** **${d_sec['weighted_value']:,.0f}**
+- **Closed Deals:** **${d_sec['won_value']:,.0f}** Won ({d_sec['won_count']} deals) vs **${d_sec['lost_value']:,.0f}** Lost ({d_sec['lost_count']} deals).
+
+#### 📊 Pipeline Stage Distribution:
+{chr(10).join(stages_list) if stages_list else "- No stage data available."}
+
+#### 💼 Key Opportunities in this Sector:
+{chr(10).join(sample_list) if sample_list else "- No sample deals available."}"""
+
+        elif any(w in q_lower for w in ["quality", "caveat", "issue", "error", "hygiene"]):
+            dq = context["data_quality_audit"]["summary"]
+            issues = context["data_quality_audit"]["sample_flagged_records"][:6]
+            issues_md = "\n".join([f"- **{iss['item']}** ({iss['board']}): {iss['details']} [Field: `{iss['field']}`, Raw: `{iss['raw']}`]" for iss in issues])
+
+            return f"""### 🛡️ Data Quality & Integrity Audit
+
+Our overall board hygiene score is **{dq['data_hygiene_score']}%** across {kpis['total_work_orders_count']} Work Orders and {kpis['total_deals_count']} Deals.
+
+- **Total Identified Issues:** **{dq['total_issues']}**
+- **High Severity Issues:** **{dq['high_severity_count']}** (primarily corrupted monetary amounts and missing client names)
+
+#### Specific Examples of Flagged Records:
+{issues_md}"""
+
+        elif any(w in q_lower for w in ["hey", "hello", "hi", "dude", "help"]):
+            return """👋 **Hello! I am your Skylark Drones Business Intelligence Agent.**
+
+I have direct access to our live **Monday.com Work Orders** and **Deals Pipeline** database in Neon PostgreSQL. 
+
+Feel free to ask me anything regarding:
+- Sectoral pipeline health (e.g. Energy/Renewables, Mining, Infrastructure)
+- Drone flight execution, completion rates, and profit margins
+- Specific data quality caveats and flagged records
+- Leadership updates for board briefings"""
+
+        else:
+            return f"""### 📊 Skylark Drones — Executive Leadership Overview
+
+- **Commercial Sales Pipeline:** Total volume is **${kpis['total_pipeline_value']:,.0f}** (Weighted: **${kpis['weighted_pipeline_value']:,.0f}**) across {kpis['total_deals_count']} deals with a **{kpis['overall_win_rate_percent']}%** win rate.
+- **Flight Operations & Execution:** **{kpis['total_work_orders_count']}** missions tracked with a **{kpis['overall_completion_rate_percent']}%** completion rate and **{kpis['overall_gross_margin_percent']}%** gross operating margin (**${kpis['gross_profit']:,.0f}** profit).
+- **Data Hygiene Audit:** Rated at **{kpis['data_hygiene_score']}%** across {kpis['total_issues_count']} tracked data quality caveats."""
 
 bi_agent = SkylarkBIAgent()
