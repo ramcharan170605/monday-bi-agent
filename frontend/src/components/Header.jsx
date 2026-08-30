@@ -43,7 +43,7 @@ export default function Header({ health, isSyncing, onSync, activeTab, setActive
         <div className="flex items-center gap-3">
           <div className="hidden md:flex items-center gap-1.5 text-xs text-slate-500">
             <span className={`h-1.5 w-1.5 rounded-full ${health?.database_connected ? 'bg-emerald-400' : 'bg-red-400'}`} />
-            <span>{health?.database_connected ? 'Connected' : 'Offline'}</span>
+            <span>{health?.database_connected ? 'Neon Connected' : 'Neon Offline'}</span>
           </div>
 
           <button
