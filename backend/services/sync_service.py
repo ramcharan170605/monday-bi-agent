@@ -1,6 +1,6 @@
 import logging
 from datetime import datetime, timezone
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from sqlalchemy.orm import Session
 
 from backend.config import settings
@@ -38,18 +38,21 @@ class SyncService:
 
         try:
             schema_data = await monday_client.get_board_schema(board_id or board_type)
+            columns_list = schema_data.get("columns", [])
+            col_id_to_title = {c["id"]: c["title"] for c in columns_list if "id" in c and "title" in c}
+
             existing_schema = db.query(BoardSchemaModel).filter(BoardSchemaModel.board_type == board_type).first()
             if existing_schema:
                 existing_schema.board_id = str(schema_data.get("id", board_id))
                 existing_schema.title = schema_data.get("name", board_type)
-                existing_schema.columns_json = schema_data.get("columns", [])
+                existing_schema.columns_json = columns_list
                 existing_schema.updated_at = datetime.now(timezone.utc)
             else:
                 new_schema = BoardSchemaModel(
                     board_id=str(schema_data.get("id", board_id or board_type)),
                     board_type=board_type,
                     title=schema_data.get("name", board_type),
-                    columns_json=schema_data.get("columns", [])
+                    columns_json=columns_list
                 )
                 db.add(new_schema)
 
@@ -79,18 +82,30 @@ class SyncService:
                     fetched_at=datetime.now(timezone.utc)
                 ))
 
-                col_text = {c.get("id"): c.get("text") for c in item.get("column_values", [])}
+                # Map column values by ID, title, and lower-case title
+                val_map: Dict[str, Any] = {}
+                for c in item.get("column_values", []):
+                    cid = c.get("id")
+                    ctext = c.get("text")
+                    if cid:
+                        val_map[cid] = ctext
+                        val_map[cid.lower()] = ctext
+                        title = col_id_to_title.get(cid)
+                        if title:
+                            val_map[title] = ctext
+                            val_map[title.lower()] = ctext
+
                 item_issues = []
 
                 if board_type == "deals":
-                    client_val = self._find_val(col_text, ["client", "customer", "account", "company", "text"])
-                    sector_val = self._find_val(col_text, ["sector", "industry", "status", "category"])
-                    stage_val = self._find_val(col_text, ["stage", "deal_stage", "phase", "status_1"])
-                    deal_val = self._find_val(col_text, ["value", "deal_value", "amount", "numbers"])
-                    prob_val = self._find_val(col_text, ["prob", "probability", "win_rate", "numbers_1"])
-                    exp_close_val = self._find_val(col_text, ["exp_close", "expected_close", "date", "close_date"])
-                    act_close_val = self._find_val(col_text, ["act_close", "actual_close", "date_1"])
-                    owner_val = self._find_val(col_text, ["owner", "deal_owner", "person", "people"])
+                    client_val = self._get_best_val(val_map, ["client code", "client", "customer", "account", "company"])
+                    owner_val = self._get_best_val(val_map, ["owner code", "deal owner", "owner", "person"])
+                    sector_val = self._get_best_val(val_map, ["sector/service", "sector", "industry", "category"])
+                    stage_val = self._get_best_val(val_map, ["deal stage", "deal status", "stage", "phase"])
+                    deal_val = self._get_best_val(val_map, ["masked deal value", "deal value", "value", "amount"])
+                    prob_val = self._get_best_val(val_map, ["closure probability", "win probability", "prob", "probability"])
+                    exp_close_val = self._get_best_val(val_map, ["tentative close date", "expected close date", "exp_close", "close date (a)"])
+                    act_close_val = self._get_best_val(val_map, ["close date (a)", "actual close date", "act_close"])
 
                     client_disp, client_key, c_flag = normalizer.normalize_client_name(client_val or item_name)
                     if c_flag:
@@ -140,17 +155,17 @@ class SyncService:
                     ))
 
                 else:
-                    client_val = self._find_val(col_text, ["client", "customer", "enterprise", "text"])
-                    project_val = self._find_val(col_text, ["project", "project_name", "title", "text_1"])
-                    sector_val = self._find_val(col_text, ["sector", "industry", "status", "category"])
-                    status_val = self._find_val(col_text, ["status", "execution_status", "state", "status_1"])
-                    start_dt_val = self._find_val(col_text, ["start_date", "flight_date", "date"])
-                    due_dt_val = self._find_val(col_text, ["due_date", "target_date", "date_1", "delivery_date"])
-                    comp_dt_val = self._find_val(col_text, ["comp_date", "completed_date", "date_2"])
-                    val_num_val = self._find_val(col_text, ["contract_val", "contract_value", "amount", "numbers"])
-                    cost_val = self._find_val(col_text, ["actual_cost", "flight_cost", "cost", "numbers_1"])
-                    pilot_val = self._find_val(col_text, ["pilot", "flight_lead", "lead", "person", "people"])
-                    loc_val = self._find_val(col_text, ["location", "site", "operational_site", "text_2"])
+                    client_val = self._get_best_val(val_map, ["customer name code", "client", "customer", "enterprise"])
+                    project_val = self._get_best_val(val_map, ["nature of work", "project title", "project", "title"])
+                    sector_val = self._get_best_val(val_map, ["sector", "industry", "category"])
+                    status_val = self._get_best_val(val_map, ["execution status", "status", "state"])
+                    start_dt_val = self._get_best_val(val_map, ["probable start date", "flight start date", "start_date"])
+                    due_dt_val = self._get_best_val(val_map, ["data delivery date", "target delivery date", "due_date", "probable end date"])
+                    comp_dt_val = self._get_best_val(val_map, ["collection date", "completion date", "comp_date"])
+                    val_num_val = self._get_best_val(val_map, ["amount in rupees (excl of gst) (masked)", "contract amount (masked)", "contract value", "contract_val", "amount"])
+                    billed_val = self._get_best_val(val_map, ["billed value in rupees (excl of gst.) (masked)", "billed value", "actual cost", "actual_cost"])
+                    pilot_val = self._get_best_val(val_map, ["bd/kam personnel code", "bd/kam lead code", "flight lead", "pilot", "person"])
+                    loc_val = self._get_best_val(val_map, ["operational site location", "location", "site"])
 
                     client_disp, client_key, c_flag = normalizer.normalize_client_name(client_val)
                     if c_flag:
@@ -176,7 +191,7 @@ class SyncService:
                         sev = "HIGH" if "NEGATIVE" in c_val_flag or "INVALID" in c_val_flag else "MEDIUM"
                         item_issues.append({"field": "contract_value", "type": "INVALID_AMOUNT", "severity": sev, "msg": c_val_flag, "raw": str(val_num_val)})
 
-                    cost_num, _ = normalizer.parse_amount(cost_val)
+                    cost_num, _ = normalizer.parse_amount(billed_val)
 
                     if not pilot_val or "unassigned" in str(pilot_val).lower():
                         item_issues.append({"field": "pilot", "type": "UNASSIGNED_PILOT", "severity": "MEDIUM", "msg": "Pilot unassigned or unavailable", "raw": str(pilot_val)})
@@ -246,14 +261,14 @@ class SyncService:
                 "issues_found": 0
             }
 
-    def _find_val(self, col_text: Dict[str, Any], candidate_keys: List[str]) -> Optional[str]:
+    def _get_best_val(self, val_map: Dict[str, Any], candidate_keys: List[str]) -> Optional[str]:
         for k in candidate_keys:
-            if k in col_text and col_text[k] is not None:
-                return col_text[k]
-        for col_id, val in col_text.items():
-            for k in candidate_keys:
-                if k in col_id.lower() and val is not None:
-                    return val
+            if k in val_map and val_map[k] is not None and str(val_map[k]).strip():
+                return str(val_map[k]).strip()
+        for k in candidate_keys:
+            for map_k, map_v in val_map.items():
+                if k in map_k and map_v is not None and str(map_v).strip():
+                    return str(map_v).strip()
         return None
 
 sync_service = SyncService()
