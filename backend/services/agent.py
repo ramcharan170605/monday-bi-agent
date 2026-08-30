@@ -51,7 +51,13 @@ class SkylarkBIAgent:
         self.model = settings.GROQ_MODEL
         self._conversation_state: Dict[str, Dict[str, Any]] = {}
 
-    async def answer_query(self, db: Session, query: str, session_id: str = "default") -> AskResponse:
+    async def answer_query(
+        self,
+        db: Session,
+        query: str,
+        session_id: str = "default",
+        history: Optional[List[Dict[str, Any]]] = None,
+    ) -> AskResponse:
         """
         Uses a query-planning step before any BI calculations are selected.
 
@@ -59,7 +65,7 @@ class SkylarkBIAgent:
         but SQL/Python tools remain the only source for numerical BI metrics.
         """
         session_key = session_id or "default"
-        previous = self._conversation_state.get(session_key)
+        previous = self._conversation_state.get(session_key) or self._previous_from_history(history or [])
         plan = await self._build_query_plan(query, previous)
         tools_used = plan.pop("tools_used", [])
 
@@ -112,6 +118,8 @@ class SkylarkBIAgent:
             "plan": plan,
             "pipeline": pipeline_data,
             "operations": ops_data,
+            "used_live_monday_cache": True,
+            "calculation_source": "Neon PostgreSQL analytical cache synchronized from Monday.com",
             "data_quality": {
                 "hygiene_score": dq_data["data_hygiene_score"],
                 "total_issues": dq_data["total_issues"],
@@ -694,6 +702,27 @@ class SkylarkBIAgent:
             "response": response.model_dump(),
             "raw_data_summary": raw_data_summary,
         }
+
+    def _previous_from_history(self, history: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        for message in reversed(history[-8:]):
+            if message.get("type") != "agent":
+                continue
+            response = {
+                "answer": message.get("text") or "",
+                "executive_summary": message.get("executive_summary"),
+                "data_quality_caveats": message.get("caveats") or [],
+                "assumptions_made": message.get("assumptions") or [],
+                "recommended_actions": message.get("actions") or [],
+                "tools_used": message.get("tools_used") or [],
+            }
+            raw_data_summary = message.get("raw_data_summary") or {}
+            return {
+                "query": message.get("query") or "previous browser conversation turn",
+                "plan": raw_data_summary.get("plan") or {},
+                "response": response,
+                "raw_data_summary": raw_data_summary,
+            }
+        return None
 
     @staticmethod
     def _dedupe(items: List[str]) -> List[str]:

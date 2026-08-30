@@ -27,11 +27,11 @@ function getSessionId() {
   return sessionId;
 }
 
-export async function askAgent(query) {
+export async function askAgent(query, history = []) {
   const res = await fetch(`${API_BASE}/ask`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ query, session_id: getSessionId() })
+    body: JSON.stringify({ query, session_id: getSessionId(), history })
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: 'Failed to process query' }));

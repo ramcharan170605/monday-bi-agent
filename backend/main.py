@@ -97,7 +97,12 @@ async def trigger_sync(req: SyncRequest = SyncRequest(), db: Session = Depends(g
 async def ask_agent(req: AskRequest, db: Session = Depends(get_db)):
     """Processes founder natural language queries with structured BI tools and returns insights + caveats."""
     try:
-        response = await bi_agent.answer_query(db, req.query, session_id=req.session_id or "default")
+        response = await bi_agent.answer_query(
+            db,
+            req.query,
+            session_id=req.session_id or "default",
+            history=req.history or [],
+        )
         return response
     except Exception as e:
         logger.exception(f"Agent reasoning failed: {e}")

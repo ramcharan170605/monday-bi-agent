@@ -77,6 +77,19 @@ Select a quick question below or type your inquiry:`
 
     setQuery('');
     const userMsgId = Date.now().toString();
+    const compactHistory = messages
+      .filter((m) => m.type === 'user' || m.type === 'agent')
+      .slice(-8)
+      .map((m) => ({
+        type: m.type,
+        text: m.text,
+        executive_summary: m.executive_summary,
+        caveats: m.caveats,
+        assumptions: m.assumptions,
+        actions: m.actions,
+        tools_used: m.tools_used,
+        raw_data_summary: m.raw_data_summary
+      }));
     setMessages(prev => [
       ...prev,
       { id: userMsgId, type: 'user', text: textToSend }
@@ -85,7 +98,7 @@ Select a quick question below or type your inquiry:`
     setIsLoading(true);
 
     try {
-      const resp = await askAgent(textToSend);
+      const resp = await askAgent(textToSend, compactHistory);
       setMessages(prev => [
         ...prev,
         {
@@ -97,7 +110,8 @@ Select a quick question below or type your inquiry:`
           caveats: resp.data_quality_caveats,
           assumptions: resp.assumptions_made,
           actions: resp.recommended_actions,
-          tools_used: resp.tools_used
+          tools_used: resp.tools_used,
+          raw_data_summary: resp.raw_data_summary
         }
       ]);
     } catch (err) {

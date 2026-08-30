@@ -5,6 +5,7 @@ from datetime import date, datetime
 class AskRequest(BaseModel):
     query: str
     session_id: Optional[str] = "default"
+    history: List[Dict[str, Any]] = Field(default_factory=list)
 
 class MetricCard(BaseModel):
     label: str
