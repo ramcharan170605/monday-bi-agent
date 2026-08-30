@@ -41,6 +41,7 @@ CAPABILITY_PATTERNS = [
 FOLLOW_UP_PATTERNS = [
     r"^\s*(is that so|really|are you sure|why|how so|explain|tell me more|what do you mean)\??\s*$",
     r"^\s*(yes|no|ok|okay|got it|thanks)\.?\s*$",
+    r"\b(summarize|summarise|summary|recap|tl;?dr|few lines|short version|make it concise|condense)\b",
 ]
 
 
@@ -64,7 +65,7 @@ class SkylarkBIAgent:
 
         if plan["intent"] == "capability":
             response = self._capability_response()
-            self._remember(session_key, query, response, plan, {})
+            self._remember(session_key, query, response, plan, response.raw_data_summary or {})
             return response
 
         if plan["intent"] == "follow_up" and previous:
@@ -74,7 +75,7 @@ class SkylarkBIAgent:
 
         if plan["intent"] == "clarify":
             response = self._clarifying_response(query)
-            self._remember(session_key, query, response, plan, {})
+            self._remember(session_key, query, response, plan, response.raw_data_summary or {})
             return response
 
         sector = plan.get("sector")
@@ -165,6 +166,8 @@ class SkylarkBIAgent:
                 "Classify the user's query for a BI agent over Monday.com Deals and Work Orders. "
                 "Return only compact JSON. Do not calculate metrics. "
                 "Valid intent values: capability, follow_up, clarify, bi. "
+                "If the user asks to summarize, recap, shorten, verify, explain, or continue a previous answer, "
+                "classify it as follow_up when previous context exists. "
                 "Set booleans for needs_pipeline, needs_operations, needs_data_quality, "
                 "wants_leadership_update. sector may be Energy, Mining, Infrastructure, "
                 "Telecom, Agriculture, Geospatial, or null."
@@ -233,6 +236,8 @@ class SkylarkBIAgent:
         intent = parsed.get("intent")
         if intent not in {"capability", "follow_up", "clarify", "bi"}:
             intent = fallback["intent"]
+        if fallback.get("intent") == "follow_up" and intent in {"clarify", "bi"}:
+            intent = "follow_up"
 
         sector = parsed.get("sector")
         if sector not in set(SECTORS.values()):
@@ -302,13 +307,23 @@ class SkylarkBIAgent:
 
     async def _answer_follow_up(self, query: str, previous: Dict[str, Any]) -> AskResponse:
         previous_response = previous.get("response") or {}
+        previous_answer = previous_response.get("answer") or ""
         last_summary = previous_response.get("executive_summary") or "the previous answer"
-        answer = (
-            f"Yes, with an important caveat: {last_summary}\n\n"
-            "That answer was grounded in the latest structured metrics available to the backend, not a text-only keyword search. "
-            "The exact numbers should still be read with the data-quality caveats shown in the previous response, especially where dates, sectors, or client matching are incomplete.\n\n"
-            "Ask me to drill into a specific sector, stage, backlog bucket, or data-quality issue and I will run the relevant calculation instead of repeating the full briefing."
-        )
+        q_lower = query.lower()
+        raw_data_summary = previous.get("raw_data_summary") or {}
+
+        if any(token in q_lower for token in ["summarize", "summarise", "summary", "recap", "tl;dr", "tldr", "few lines", "short version", "condense"]):
+            answer = await self._summarize_previous_answer(query, previous_answer, raw_data_summary, last_summary)
+        elif any(token in q_lower for token in ["why", "how so", "explain", "tell me more", "what do you mean"]):
+            answer = await self._explain_previous_answer(query, previous_answer, raw_data_summary, last_summary)
+        else:
+            answer = (
+                f"Yes. The short version is: {last_summary}\n\n"
+                "That response came from the agent's structured calculation tools and was then synthesized by the LLM. "
+                "The caveat is that the underlying Monday data still has quality issues, so client matching, dates, and sector labels should be treated as decision-support signals rather than perfectly audited finance numbers.\n\n"
+                "I can drill into any one part next: pipeline risk, sector demand, work-order execution, margin, or data hygiene."
+            )
+
         return AskResponse(
             answer=answer,
             executive_summary=last_summary,
@@ -319,6 +334,123 @@ class SkylarkBIAgent:
             tools_used=["conversation_follow_up"],
             raw_data_summary=previous.get("raw_data_summary"),
         )
+
+    async def _summarize_previous_answer(
+        self,
+        query: str,
+        previous_answer: str,
+        raw_data_summary: Dict[str, Any],
+        last_summary: str,
+    ) -> str:
+        if self.groq_api_key and self.groq_api_key.strip() and previous_answer:
+            try:
+                from groq import AsyncGroq
+
+                client = AsyncGroq(api_key=self.groq_api_key)
+                response = await client.chat.completions.create(
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": (
+                                "Summarize the previous BI answer in 3-5 crisp executive lines. "
+                                "Keep the most important computed numbers exactly as provided. "
+                                "Include one caveat if material. Do not ask a clarifying question."
+                            ),
+                        },
+                        {
+                            "role": "user",
+                            "content": json.dumps({
+                                "user_follow_up": query,
+                                "previous_answer": previous_answer,
+                                "previous_computed_context": raw_data_summary,
+                            }, default=str),
+                        },
+                    ],
+                    model=self.model,
+                    temperature=0.1,
+                    max_tokens=450,
+                )
+                return response.choices[0].message.content
+            except Exception as e:
+                logger.warning(f"Groq follow-up summary failed; using deterministic summary: {e}")
+
+        return self._deterministic_previous_summary(raw_data_summary, last_summary, previous_answer)
+
+    async def _explain_previous_answer(
+        self,
+        query: str,
+        previous_answer: str,
+        raw_data_summary: Dict[str, Any],
+        last_summary: str,
+    ) -> str:
+        if self.groq_api_key and self.groq_api_key.strip() and previous_answer:
+            try:
+                from groq import AsyncGroq
+
+                client = AsyncGroq(api_key=self.groq_api_key)
+                response = await client.chat.completions.create(
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": (
+                                "Explain the previous BI answer like a practical founder briefing. "
+                                "Connect the metrics to business meaning. Keep numbers grounded in the provided context. "
+                                "Do not introduce new calculations."
+                            ),
+                        },
+                        {
+                            "role": "user",
+                            "content": json.dumps({
+                                "user_follow_up": query,
+                                "previous_answer": previous_answer,
+                                "previous_computed_context": raw_data_summary,
+                            }, default=str),
+                        },
+                    ],
+                    model=self.model,
+                    temperature=0.15,
+                    max_tokens=700,
+                )
+                return response.choices[0].message.content
+            except Exception as e:
+                logger.warning(f"Groq follow-up explanation failed; using deterministic explanation: {e}")
+
+        return (
+            f"The previous answer means: {last_summary}\n\n"
+            "The agent first selected the relevant BI tools, then calculated metrics from the normalized Monday.com cache. "
+            "The LLM's job was to explain the implications, not to make up the numbers."
+        )
+
+    def _deterministic_previous_summary(self, raw_data_summary: Dict[str, Any], last_summary: str, previous_answer: str = "") -> str:
+        pipeline = raw_data_summary.get("pipeline")
+        ops = raw_data_summary.get("operations")
+        dq = raw_data_summary.get("data_quality")
+        lines = []
+        if pipeline:
+            lines.append(
+                f"- Pipeline is ${pipeline['total_pipeline_value']:,.0f} total and ${pipeline['weighted_pipeline_value']:,.0f} weighted, with a {pipeline['win_rate_percent']}% win rate."
+            )
+        if ops:
+            lines.append(
+                f"- Operations show {ops['total_work_orders']} work orders, {ops['completion_rate_percent']}% completion, and {ops['gross_margin_percent']}% gross margin."
+            )
+        if dq:
+            lines.append(
+                f"- Data hygiene is {dq['hygiene_score']}%, with {dq['total_issues']} tracked caveats that should be disclosed in leadership reporting."
+            )
+        if not lines:
+            if raw_data_summary.get("intent") == "capability":
+                return (
+                    "- I can answer questions about pipeline, revenue, sectors, operations, backlog, margins, and data quality.\n"
+                    "- I calculate numbers from Monday.com data cached in Neon/PostgreSQL, then use the LLM to explain the business meaning.\n"
+                    "- I will flag caveats when dates, client names, sectors, or operational records are incomplete."
+                )
+            clean_answer = re.sub(r"\s+", " ", previous_answer or "").strip()
+            if clean_answer:
+                lines.append(f"- {clean_answer[:320].rstrip()}")
+            else:
+                lines.append(f"- {last_summary}")
+        return "\n".join(lines)
 
     def _clarifying_response(self, query: str) -> AskResponse:
         return AskResponse(
@@ -370,7 +502,10 @@ class SkylarkBIAgent:
                         "Do not repeat a generic executive briefing unless the user asked for one. "
                         "If the question is narrow, answer narrowly. Always mention material caveats. "
                         "Do not use markdown tables; the hosted UI renders compact bullets and headings more reliably. "
-                        "Use short labeled bullet groups for metrics, stage breakdowns, caveats, and recommendations."
+                        "Use short labeled bullet groups for metrics, stage breakdowns, caveats, and recommendations. "
+                        "For leadership updates, do not just list metrics. Produce a board-ready decision brief with: "
+                        "1) headline judgment, 2) what changed or matters, 3) risks/blockers, 4) decisions or asks for leadership, "
+                        "5) data-quality caveats. Tie pipeline and operations together when both are provided."
                     ),
                 },
                 {"role": "user", "content": json.dumps(prompt, default=str)},
@@ -393,13 +528,32 @@ class SkylarkBIAgent:
         title = f" for the **{sector} Sector**" if sector else ""
 
         if plan.get("wants_leadership_update"):
+            ops_risk = (
+                f"{ops['delayed_count']} delayed missions need review"
+                if ops["delayed_count"] > 0
+                else "execution delay count is currently zero, but pilot coverage and handoffs still need monitoring"
+            )
+            leadership_ask = (
+                "unblock delayed missions"
+                if ops["delayed_count"] > 0
+                else "protect pilot capacity for active and upcoming work orders"
+            )
             return (
-                f"## Leadership Executive Update{title}\n\n"
-                f"**Pipeline:** ${pipeline['total_pipeline_value']:,.0f} total pipeline across {pipeline['total_deals']} deals, "
-                f"with ${pipeline['weighted_pipeline_value']:,.0f} probability-weighted value and a {pipeline['win_rate_percent']}% win rate.\n\n"
-                f"**Operations:** {ops['total_work_orders']} work orders represent ${ops['total_contract_value']:,.0f} contracted value. "
-                f"Completion is {ops['completion_rate_percent']}%, with {ops['delayed_count']} delayed missions and {ops['gross_margin_percent']}% gross margin.\n\n"
-                f"**Data hygiene:** {dq['total_issues']} quality issues are currently tracked, producing a {dq['data_hygiene_score']}% hygiene score."
+                f"## Leadership Update{title}\n\n"
+                f"**Headline judgment:** Demand is large, but conversion quality needs attention: "
+                f"${pipeline['total_pipeline_value']:,.0f} total pipeline is carrying only "
+                f"${pipeline['weighted_pipeline_value']:,.0f} weighted value and a {pipeline['win_rate_percent']}% win rate.\n\n"
+                f"**Commercial picture:** {pipeline['total_deals']} deals are in scope, with "
+                f"${pipeline['won_value']:,.0f} won versus ${pipeline['lost_value']:,.0f} lost. "
+                f"Leadership should focus on whether large early-stage opportunities are real near-term revenue or inflated pipeline.\n\n"
+                f"**Operational readiness:** {ops['total_work_orders']} work orders represent "
+                f"${ops['total_contract_value']:,.0f} contracted value. Execution is healthy at "
+                f"{ops['completion_rate_percent']}% completion and {ops['gross_margin_percent']}% gross margin, "
+                f"and {ops_risk}.\n\n"
+                f"**Leadership asks:** Confirm owners and next actions for high-value open deals, {leadership_ask}, "
+                f"and clean the records most likely to distort board reporting.\n\n"
+                f"**Data caveat:** {dq['total_issues']} quality issues are tracked with a "
+                f"{dq['data_hygiene_score']}% hygiene score, so this should be treated as operational BI, not audited finance."
             )
 
         sections = [f"## Business Intelligence Answer{title}"]
