@@ -111,6 +111,7 @@ The model can **chain tool calls** across up to 4 rounds. For example:
 - Natural language questions routed to the right data source by the LLM
 - Cross-board analysis when questions span both Deals and Work Orders
 - Sector, status, client, and pilot filters applied automatically
+- Conversation history tracking for natural multi-turn drill-downs
 
 ### 📊 Deterministic BI Computations
 - Revenue, pipeline volume, win rates, and gross margins computed via **SQL/Python** — never hallucinated
