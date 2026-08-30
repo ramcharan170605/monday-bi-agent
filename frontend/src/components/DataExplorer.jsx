@@ -13,13 +13,12 @@ export default function DataExplorer() {
   const loadData = async () => {
     setLoading(true);
     try {
-      if (boardType === 'work_orders') {
-        const data = await fetchWorkOrders(sectorFilter);
-        setWorkOrders(data);
-      } else {
-        const data = await fetchDeals(sectorFilter);
-        setDeals(data);
-      }
+      const [woData, dealData] = await Promise.all([
+        fetchWorkOrders(sectorFilter),
+        fetchDeals(sectorFilter),
+      ]);
+      setWorkOrders(woData);
+      setDeals(dealData);
     } catch (err) {
       console.error(err);
     } finally {
@@ -27,7 +26,7 @@ export default function DataExplorer() {
     }
   };
 
-  useEffect(() => { loadData(); }, [boardType, sectorFilter]);
+  useEffect(() => { loadData(); }, [sectorFilter]);
 
   const items = boardType === 'work_orders' ? workOrders : deals;
   const filtered = items.filter(item => {
@@ -58,11 +57,11 @@ export default function DataExplorer() {
   };
 
   const formatCurrency = (val) => {
-    if (!val || val === 0) return '—';
+    if (!val || val === 0) return '\u2014';
     const n = Number(val);
-    if (n >= 1_000_000) return `₹${(n / 1_000_000).toFixed(1)}M`;
-    if (n >= 1_000) return `₹${(n / 1_000).toFixed(0)}K`;
-    return `₹${n.toLocaleString()}`;
+    if (n >= 1_000_000) return `\u20B9${(n / 1_000_000).toFixed(1)}M`;
+    if (n >= 1_000) return `\u20B9${(n / 1_000).toFixed(0)}K`;
+    return `\u20B9${n.toLocaleString()}`;
   };
 
   return (
@@ -93,7 +92,7 @@ export default function DataExplorer() {
             <Search className="w-3.5 h-3.5 text-slate-500 absolute left-2.5 top-2" />
             <input
               type="text"
-              placeholder="Search…"
+              placeholder="Search\u2026"
               value={searchTerm}
               onChange={(e) => setSearchTerm(e.target.value)}
               className="pl-8 pr-3 py-1.5 rounded-lg bg-slate-900/60 border border-slate-700/40 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-slate-600 w-40"
@@ -143,15 +142,15 @@ export default function DataExplorer() {
                   <tr key={wo.id} className="hover:bg-slate-800/30 transition-colors text-slate-300">
                     <td className="px-4 py-2.5 font-medium text-white flex items-center gap-1.5">
                       {wo.data_quality_flags?.length > 0 && <AlertTriangle className="w-3 h-3 text-amber-500/60 shrink-0" />}
-                      <span>{wo.work_order_no || '—'}</span>
+                      <span>{wo.work_order_no || '\u2014'}</span>
                     </td>
-                    <td className="px-4 py-2.5">{wo.client_name || '—'}</td>
-                    <td className="px-4 py-2.5 text-slate-400">{wo.normalized_sector || '—'}</td>
+                    <td className="px-4 py-2.5">{wo.client_name || '\u2014'}</td>
+                    <td className="px-4 py-2.5 text-slate-400">{wo.normalized_sector || '\u2014'}</td>
                     <td className="px-4 py-2.5"><StatusBadge status={wo.normalized_status} /></td>
                     <td className="px-4 py-2.5 text-right font-mono text-slate-200">{formatCurrency(wo.contract_value)}</td>
                     <td className="px-4 py-2.5 text-right font-mono text-slate-400">{formatCurrency(wo.actual_cost)}</td>
-                    <td className="px-4 py-2.5 text-slate-400">{wo.assigned_pilot_or_lead || '—'}</td>
-                    <td className="px-4 py-2.5 font-mono text-slate-500 text-[11px]">{wo.due_date || '—'}</td>
+                    <td className="px-4 py-2.5 text-slate-400">{wo.assigned_pilot_or_lead || '\u2014'}</td>
+                    <td className="px-4 py-2.5 font-mono text-slate-500 text-[11px]">{wo.due_date || '\u2014'}</td>
                   </tr>
                 ))}
                 {filtered.length === 0 && (
@@ -179,16 +178,16 @@ export default function DataExplorer() {
                   <tr key={d.id} className="hover:bg-slate-800/30 transition-colors text-slate-300">
                     <td className="px-4 py-2.5 font-medium text-white flex items-center gap-1.5">
                       {d.data_quality_flags?.length > 0 && <AlertTriangle className="w-3 h-3 text-amber-500/60 shrink-0" />}
-                      <span className="truncate max-w-[180px]">{d.deal_name || '—'}</span>
+                      <span className="truncate max-w-[180px]">{d.deal_name || '\u2014'}</span>
                     </td>
-                    <td className="px-4 py-2.5">{d.client_name || '—'}</td>
-                    <td className="px-4 py-2.5 text-slate-400">{d.normalized_sector || '—'}</td>
+                    <td className="px-4 py-2.5">{d.client_name || '\u2014'}</td>
+                    <td className="px-4 py-2.5 text-slate-400">{d.normalized_sector || '\u2014'}</td>
                     <td className="px-4 py-2.5"><StatusBadge status={d.normalized_stage} /></td>
                     <td className="px-4 py-2.5 text-right font-mono text-slate-200">{formatCurrency(d.deal_value)}</td>
                     <td className="px-4 py-2.5 text-right font-mono text-slate-400">{d.probability || 0}%</td>
                     <td className="px-4 py-2.5 text-right font-mono text-emerald-400/80">{formatCurrency(d.weighted_value)}</td>
-                    <td className="px-4 py-2.5 text-slate-400">{d.deal_owner || '—'}</td>
-                    <td className="px-4 py-2.5 font-mono text-slate-500 text-[11px]">{d.expected_close_date || '—'}</td>
+                    <td className="px-4 py-2.5 text-slate-400">{d.deal_owner || '\u2014'}</td>
+                    <td className="px-4 py-2.5 font-mono text-slate-500 text-[11px]">{d.expected_close_date || '\u2014'}</td>
                   </tr>
                 ))}
                 {filtered.length === 0 && (
