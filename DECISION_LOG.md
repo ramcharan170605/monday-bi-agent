@@ -23,8 +23,8 @@ FastAPI BI Agent Backend (Render)
         │       ├── normalized deals
         │       └── data_quality_issues
         │
-        └──► Groq LLM Engine (Llama 3.3 70B / GPT-OSS)
-                ├── Intent Parsing & Tool Dispatch
+        └──► Groq LLM Engine (openai/gpt-oss-20b)
+                ├── Intent Planning & Tool Dispatch
                 └── Executive Narrative & Caveat Synthesis
 ```
 
@@ -37,7 +37,7 @@ FastAPI BI Agent Backend (Render)
 | **Data Source of Truth** | **Monday.com (Direct Read-Only GraphQL API)** | Monday.com remains the live operational database. Direct GraphQL v2 API was chosen over Monday MCP because it delivers predictable cursor-based pagination, schema introspection, rate-limit retry backoff, and zero MCP daemon friction for a hosted deployment. |
 | **Analytical Store** | **Neon Serverless PostgreSQL** | Used strictly as a **read-through analytical cache**, not an independent system of record. Relational SQL enables deterministic multi-table joins, exact aggregations, and granular auditability of data quality issues. |
 | **RAG vs. Structured SQL Engine** | **Structured Calculations (No Vector-Only RAG)** | **RAG / Vector DB was explicitly rejected for BI math.** Embeddings are inherently fuzzy and cannot calculate revenue, win rates, or operational margins accurately. Structured SQL and Python computations guarantee 100% mathematical precision. |
-| **LLM & Tool Orchestration** | **Groq (GPT-OSS / Llama 3.3 70B Versatile)** | Groq provides sub-second inference latency, deterministic tool calling, and low cost. The LLM is used strictly for intent classification and executive synthesis; it never invents numbers. |
+| **LLM & Tool Orchestration** | **Groq `openai/gpt-oss-20b`** | Groq provides low-latency inference, practical JSON planning, and low cost. The LLM is used for intent planning and executive synthesis; SQL/Python tools remain the only source for numerical metrics. |
 | **UI Implementation** | **React + Tailwind + 21st.dev MCP Patterns** | Focused on an executive-grade conversational UI with structured KPI cards, live data quality audit drawer, and board explorer, rather than complex bloated charts. |
 
 ---

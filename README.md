@@ -32,8 +32,8 @@
                                                      ▼
                                       ┌──────────────────────────────┐
                                       │       Groq LLM Engine        │
-                                      │  (Llama 3.3 70B / GPT-OSS)   │
-                                      │  • Intent Routing            │
+                                      │     (openai/gpt-oss-20b)     │
+                                      │  • Intent Planning           │
                                       │  • Executive Briefing Format │
                                       └──────────────────────────────┘
 ```
@@ -45,7 +45,7 @@
 - **Deterministic BI Computations:** Numerical answers (revenue, pipeline volume, win rate, gross margin, completion percentage) are computed strictly via SQL/Python logic — **never hallucinated via embeddings**.
 - **Resilient Data Normalization:** Automatically parses mixed date formats (`DD/MM/YYYY`, `YYYY-MM-DD`, text dates), formats messy currency strings (`$160k`, `1.5M`, dirty commas), and normalizes client company aliases.
 - **Automated Data Quality Audit:** Scans for missing milestone dates, negative contract values, unassigned drone pilots, and cross-board orphaned records with a live **Data Hygiene Score (0-100%)**.
-- **Founder Executive Chat:** Features suggested founder questions, interactive KPI cards, markdown briefings, and expandable caveat drawers.
+- **Founder Executive Chat:** Features suggested founder questions, scoped KPI cards, markdown briefings, conversational follow-ups, and expandable caveat drawers.
 - **Dual Mode (Live & Fallback):** Connects to live Monday.com boards via GraphQL API v2 with automatic fallback dataset generation for offline evaluation.
 
 ---
@@ -56,7 +56,7 @@ Copy `.env.example` to `.env` and configure:
 
 ```env
 # Neon PostgreSQL Database URL
-DATABASE_URL=postgresql://neondb_owner:...@ep-little-pond-a6sl2gzf.us-west-2.aws.neon.tech/neondb?sslmode=require
+DATABASE_URL=postgresql://USER:PASSWORD@HOST/neondb?sslmode=require
 
 # Monday.com API Access
 MONDAY_API_TOKEN=your_monday_personal_api_token
@@ -65,7 +65,7 @@ DEALS_BOARD_ID=your_deals_board_id
 
 # Groq LLM API Key
 GROQ_API_KEY=gsk_your_groq_api_key
-GROQ_MODEL=llama-3.3-70b-versatile
+GROQ_MODEL=openai/gpt-oss-20b
 
 # Server Port
 PORT=8000

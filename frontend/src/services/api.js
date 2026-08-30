@@ -16,11 +16,22 @@ export async function syncBoards(forceMock = false) {
   return res.json();
 }
 
+const SESSION_STORAGE_KEY = 'skylark-bi-session-id';
+
+function getSessionId() {
+  let sessionId = window.sessionStorage.getItem(SESSION_STORAGE_KEY);
+  if (!sessionId) {
+    sessionId = `web-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    window.sessionStorage.setItem(SESSION_STORAGE_KEY, sessionId);
+  }
+  return sessionId;
+}
+
 export async function askAgent(query) {
   const res = await fetch(`${API_BASE}/ask`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ query })
+    body: JSON.stringify({ query, session_id: getSessionId() })
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: 'Failed to process query' }));
