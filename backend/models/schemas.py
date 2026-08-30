@@ -25,7 +25,6 @@ class AskResponse(BaseModel):
 
 class SyncRequest(BaseModel):
     board_type: Optional[str] = "all"
-    force_mock: Optional[bool] = False
 
 class SyncResponse(BaseModel):
     status: str

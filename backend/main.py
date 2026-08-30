@@ -34,8 +34,8 @@ async def lifespan(app: FastAPI):
     with Session(engine) as db:
         wo_count = db.query(WorkOrderModel).count()
         deals_count = db.query(DealModel).count()
-        if wo_count == 0 and deals_count == 0:
-            logger.info("Initial database is empty, performing initial sync/seed...")
+        if wo_count == 0 and deals_count == 0 and monday_client.is_configured():
+            logger.info("Initial database is empty, performing initial sync from Monday.com...")
             try:
                 await sync_service.sync_all_boards(db)
                 logger.info("Initial sync completed successfully.")
@@ -87,7 +87,7 @@ def health_check(db: Session = Depends(get_db)):
 async def trigger_sync(req: SyncRequest = SyncRequest(), db: Session = Depends(get_db)):
     """Triggers dynamic read from Monday.com boards, normalizes records, and updates cache."""
     try:
-        result = await sync_service.sync_all_boards(db, force_mock=req.force_mock)
+        result = await sync_service.sync_all_boards(db)
         return SyncResponse(**result)
     except Exception as e:
         logger.exception(f"Sync execution failed: {e}")
@@ -118,7 +118,7 @@ def get_boards_overview(db: Session = Depends(get_db)):
 def list_work_orders(
     sector: Optional[str] = None,
     status: Optional[str] = None,
-    limit: int = 50,
+    limit: int = 200,
     db: Session = Depends(get_db)
 ):
     """Returns normalized work orders for tabular inspection."""
@@ -133,7 +133,7 @@ def list_work_orders(
 def list_deals(
     sector: Optional[str] = None,
     stage: Optional[str] = None,
-    limit: int = 50,
+    limit: int = 400,
     db: Session = Depends(get_db)
 ):
     """Returns normalized deals for tabular inspection."""

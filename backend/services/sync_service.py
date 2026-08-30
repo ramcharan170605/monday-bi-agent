@@ -14,9 +14,12 @@ from backend.services.normalizer import normalizer
 logger = logging.getLogger(__name__)
 
 class SyncService:
-    async def sync_all_boards(self, db: Session, force_mock: bool = False) -> Dict[str, Any]:
-        wo_result = await self.sync_board(db, "work_orders", settings.WORK_ORDERS_BOARD_ID, force_mock)
-        deals_result = await self.sync_board(db, "deals", settings.DEALS_BOARD_ID, force_mock)
+    async def sync_all_boards(self, db: Session) -> Dict[str, Any]:
+        if not settings.WORK_ORDERS_BOARD_ID or not settings.DEALS_BOARD_ID:
+            raise RuntimeError("Both WORK_ORDERS_BOARD_ID and DEALS_BOARD_ID must be configured in environment variables.")
+
+        wo_result = await self.sync_board(db, "work_orders", settings.WORK_ORDERS_BOARD_ID)
+        deals_result = await self.sync_board(db, "deals", settings.DEALS_BOARD_ID)
 
         return {
             "status": "SUCCESS" if wo_result["status"] == "SUCCESS" and deals_result["status"] == "SUCCESS" else "PARTIAL",
@@ -27,7 +30,10 @@ class SyncService:
             "synced_at": datetime.now(timezone.utc)
         }
 
-    async def sync_board(self, db: Session, board_type: str, board_id: str, force_mock: bool = False) -> Dict[str, Any]:
+    async def sync_board(self, db: Session, board_type: str, board_id: str) -> Dict[str, Any]:
+        if not board_id or not str(board_id).strip():
+            raise ValueError(f"Board ID for {board_type} is not configured.")
+
         sync_run = SyncRunModel(
             board_type=board_type,
             status="IN_PROGRESS",
@@ -37,7 +43,7 @@ class SyncService:
         db.flush()
 
         try:
-            schema_data = await monday_client.get_board_schema(board_id or board_type)
+            schema_data = await monday_client.get_board_schema(board_id)
             columns_list = schema_data.get("columns", [])
             col_id_to_title = {c["id"]: c["title"] for c in columns_list if "id" in c and "title" in c}
 
@@ -49,14 +55,14 @@ class SyncService:
                 existing_schema.updated_at = datetime.now(timezone.utc)
             else:
                 new_schema = BoardSchemaModel(
-                    board_id=str(schema_data.get("id", board_id or board_type)),
+                    board_id=str(schema_data.get("id", board_id)),
                     board_type=board_type,
                     title=schema_data.get("name", board_type),
                     columns_json=columns_list
                 )
                 db.add(new_schema)
 
-            raw_items = await monday_client.fetch_board_items(board_id or board_type)
+            raw_items = await monday_client.fetch_board_items(board_id)
             sync_run.items_fetched = len(raw_items)
 
             db.query(DataQualityIssueModel).filter(DataQualityIssueModel.board_type == board_type).delete()
