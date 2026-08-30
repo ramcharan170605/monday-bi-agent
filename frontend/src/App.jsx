@@ -99,12 +99,26 @@ Select a quick question below or type your inquiry:`
 
     try {
       const resp = await askAgent(textToSend, compactHistory);
+      
+      let displayText = resp.answer || '';
+      if (typeof displayText === 'string' && displayText.trim().startsWith('{') && displayText.includes('"answer"')) {
+        try {
+          const parsed = JSON.parse(displayText.trim());
+          if (parsed.answer) displayText = parsed.answer;
+        } catch (e) {
+          const match = displayText.match(/"answer"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+          if (match && match[1]) {
+            displayText = match[1].replace(/\\n/g, '\n').replace(/\\"/g, '"');
+          }
+        }
+      }
+
       setMessages(prev => [
         ...prev,
         {
           id: (Date.now() + 1).toString(),
           type: 'agent',
-          text: resp.answer,
+          text: displayText,
           executive_summary: resp.executive_summary,
           metrics: resp.metrics,
           caveats: resp.data_quality_caveats,

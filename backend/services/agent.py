@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 from typing import Dict, Any, List, Optional
 from sqlalchemy.orm import Session
 from sqlalchemy import func, or_
@@ -69,6 +70,40 @@ TOOL_DEFINITIONS = [
         }
     }
 ]
+
+def extract_clean_json(content: str) -> Dict[str, Any]:
+    """Robustly extracts JSON dictionary from LLM response strings."""
+    if not content:
+        return {}
+    
+    text = content.strip()
+    
+    # 1. Remove markdown code blocks if wrapped
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\s*```$", "", text)
+        text = text.strip()
+
+    # 2. Try direct json.loads
+    try:
+        data = json.loads(text)
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+
+    # 3. Find outermost { and }
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        try:
+            data = json.loads(text[start:end+1])
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
+
+    return {}
 
 class SkylarkBIAgent:
     def __init__(self):
@@ -200,7 +235,7 @@ class SkylarkBIAgent:
     ) -> AskResponse:
         """
         Pure LLM reasoning with live Neon DB tool execution.
-        Zero hardcoded lexical rules, zero static metric templates.
+        Never leaks raw JSON in the conversation.
         """
         tools_used = []
         executed_data: Dict[str, Any] = {}
@@ -214,18 +249,18 @@ class SkylarkBIAgent:
                     "You are Skylark Drones' Lead Business Intelligence Agent. "
                     "You answer questions from founders, executives, and department leads by querying live Monday.com Work Orders and Deals data in Neon PostgreSQL.\n\n"
                     "INSTRUCTIONS:\n"
-                    "1. For greetings or general questions, respond warmly and conversationally without calling tools or generating unnecessary cards.\n"
+                    "1. For greetings or general conversation, respond naturally and warmly. Explain how you help.\n"
                     "2. For business questions (pipeline, flight operations, backlog, margins, sectors, data quality, leadership updates), call the appropriate database tool(s) to fetch the exact numbers.\n"
                     "3. Format your final response strictly as a JSON object with this structure:\n"
                     "{\n"
-                    '  "answer": "Detailed markdown response answering the question directly and articulately",\n'
+                    '  "answer": "Clear markdown answer without raw JSON formatting",\n'
                     '  "executive_summary": "1-line executive takeaway",\n'
                     '  "metrics": [{"label": "Metric Name", "value": "$X / Y%", "subtext": "context", "sentiment": "positive|negative|warning|neutral"}],\n'
                     '  "data_quality_caveats": ["caveat 1", "caveat 2"],\n'
                     '  "recommended_actions": ["action 1", "action 2"]\n'
                     "}\n"
-                    "4. If a question doesn't need metric cards (e.g. greetings, simple explanations), set 'metrics': []. Only include relevant metric badges.\n"
-                    "5. Never invent numbers. Always ground figures in tool outputs."
+                    "4. If a question does not require KPI badges (such as greetings or simple questions), set 'metrics': [].\n"
+                    "5. Never output raw JSON keys inside the 'answer' field. 'answer' must be clean markdown prose."
                 )
 
                 messages = [{"role": "system", "content": system_prompt}]
@@ -278,8 +313,8 @@ class SkylarkBIAgent:
                         temperature=0.2,
                         response_format={"type": "json_object"}
                     )
-                    content = step2_resp.choices[0].message.content
-                    parsed = json.loads(content)
+                    content = step2_resp.choices[0].message.content or ""
+                    parsed = extract_clean_json(content)
 
                     # Build metric cards
                     metric_cards = []
@@ -292,8 +327,15 @@ class SkylarkBIAgent:
                                 sentiment=m.get("sentiment", "neutral")
                             ))
 
+                    clean_answer = parsed.get("answer") or content
+                    # If clean_answer is still JSON string, extract the answer field
+                    if isinstance(clean_answer, str) and clean_answer.strip().startswith("{"):
+                        nested = extract_clean_json(clean_answer)
+                        if nested.get("answer"):
+                            clean_answer = nested["answer"]
+
                     return AskResponse(
-                        answer=parsed.get("answer", "Here are the requested insights from our Monday.com database."),
+                        answer=clean_answer,
                         executive_summary=parsed.get("executive_summary", "Insights processed from live Monday.com records."),
                         metrics=metric_cards,
                         data_quality_caveats=parsed.get("data_quality_caveats", []),
@@ -304,34 +346,36 @@ class SkylarkBIAgent:
                     )
 
                 else:
-                    # No tools needed (e.g. greeting or conversation)
+                    # No tools called (e.g. conversational / greeting)
                     content = choice.message.content or ""
-                    try:
-                        parsed = json.loads(content)
-                        return AskResponse(
-                            answer=parsed.get("answer", content),
-                            executive_summary=parsed.get("executive_summary", "Welcome to Skylark Drones BI Assistant."),
-                            metrics=[],
-                            data_quality_caveats=[],
-                            assumptions_made=[],
-                            recommended_actions=[],
-                            tools_used=["groq_conversational_response"],
-                            raw_data_summary={"intent": "conversational"}
-                        )
-                    except:
-                        return AskResponse(
-                            answer=content,
-                            executive_summary="Skylark Drones Business Intelligence Assistant.",
-                            metrics=[],
-                            data_quality_caveats=[],
-                            assumptions_made=[],
-                            recommended_actions=[],
-                            tools_used=["groq_conversational_response"],
-                            raw_data_summary={"intent": "conversational"}
-                        )
+                    parsed = extract_clean_json(content)
+
+                    if parsed and "answer" in parsed:
+                        clean_answer = parsed["answer"]
+                        exec_summary = parsed.get("executive_summary", "Skylark Drones BI Assistant.")
+                    else:
+                        clean_answer = content
+                        exec_summary = "Skylark Drones BI Assistant."
+
+                    # If clean_answer contains raw JSON, clean it
+                    if clean_answer.strip().startswith("{") and '"answer":' in clean_answer:
+                        nested = extract_clean_json(clean_answer)
+                        if nested.get("answer"):
+                            clean_answer = nested["answer"]
+
+                    return AskResponse(
+                        answer=clean_answer,
+                        executive_summary=exec_summary,
+                        metrics=[],
+                        data_quality_caveats=[],
+                        assumptions_made=[],
+                        recommended_actions=[],
+                        tools_used=["groq_conversational_response"],
+                        raw_data_summary={"intent": "conversational"}
+                    )
 
             except Exception as e:
-                logger.error(f"Groq tool-calling flow failed, falling back to direct context: {e}")
+                logger.error(f"Groq tool-calling flow failed: {e}")
 
         # Fallback if Groq API key is missing
         overview = self.execute_tool(db, "get_full_leadership_overview", {})
