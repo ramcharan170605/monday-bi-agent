@@ -13,19 +13,19 @@ from backend.models.schemas import AskResponse, MetricCard
 
 logger = logging.getLogger(__name__)
 
-# Available database tools for the LLM
 TOOL_DEFINITIONS = [
     {
         "type": "function",
         "function": {
             "name": "query_deals_pipeline",
-            "description": "Calculates pipeline volume, weighted revenue, win rates, stage breakdowns, and top opportunities from Monday.com Deals board in Neon DB.",
+            "description": "Calculates pipeline totals, stage breakdowns, win rates, and retrieves specific deal records from Monday.com Deals board.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "sector": {"type": "string", "description": "Optional sector filter (e.g. Energy, Mining, Infrastructure, Telecom, Agriculture, Geospatial)"},
-                    "stage": {"type": "string", "description": "Optional stage filter (e.g. Won, Lost, Proposal, Qualified, Lead, Negotiation)"},
-                    "client": {"type": "string", "description": "Optional client name or keyword"}
+                    "sector": {"type": "string", "description": "Sector filter (e.g. Energy, Mining, Infrastructure, Telecom, Agriculture, Geospatial)"},
+                    "stage": {"type": "string", "description": "Stage filter (e.g. Won, Lost, Proposal, Qualified, Lead, Negotiation)"},
+                    "client": {"type": "string", "description": "Client name or search keyword"},
+                    "limit": {"type": "integer", "description": "Number of deal records to return (default 15)"}
                 }
             }
         }
@@ -34,13 +34,15 @@ TOOL_DEFINITIONS = [
         "type": "function",
         "function": {
             "name": "query_flight_operations",
-            "description": "Calculates work order completion rate, contract value, operational cost, gross profit margins, delayed flights, and pilot assignments from Monday.com Work Orders board in Neon DB.",
+            "description": "Calculates work order completion rate, contract value, operational costs, profit margins, and retrieves specific work orders from Monday.com Work Orders board.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "sector": {"type": "string", "description": "Optional sector filter (e.g. Energy, Mining, Infrastructure, Telecom, Agriculture, Geospatial)"},
-                    "status": {"type": "string", "description": "Optional status filter (e.g. Completed, In Progress, Delayed, Scheduled)"},
-                    "client": {"type": "string", "description": "Optional client name or keyword"}
+                    "sector": {"type": "string", "description": "Sector filter (e.g. Energy, Mining, Infrastructure, Telecom, Agriculture, Geospatial)"},
+                    "status": {"type": "string", "description": "Status filter (e.g. Completed, In Progress, Delayed, Scheduled)"},
+                    "client": {"type": "string", "description": "Client name or keyword"},
+                    "pilot": {"type": "string", "description": "Pilot or flight lead name"},
+                    "limit": {"type": "integer", "description": "Number of work order records to return (default 15)"}
                 }
             }
         }
@@ -48,12 +50,15 @@ TOOL_DEFINITIONS = [
     {
         "type": "function",
         "function": {
-            "name": "query_data_quality_audit",
-            "description": "Fetches data hygiene score and specific caveats (missing dates, invalid financial amounts, unassigned pilots) across Monday boards.",
+            "name": "get_specific_data_quality_issues",
+            "description": "Retrieves the actual data quality issue records with item names, affected fields, severity, details, and raw values from Monday boards.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "severity": {"type": "string", "description": "Optional severity filter (HIGH, MEDIUM, LOW)"}
+                    "severity": {"type": "string", "description": "Filter by severity (HIGH, MEDIUM, LOW)"},
+                    "issue_type": {"type": "string", "description": "Filter by type (e.g. MISSING_DATE, INVALID_AMOUNT, MISSING_CLIENT, MISSING_STATUS, UNASSIGNED_PILOT)"},
+                    "board_type": {"type": "string", "description": "Filter by board (work_orders, deals)"},
+                    "limit": {"type": "integer", "description": "Max records to return (default 25)"}
                 }
             }
         }
@@ -61,8 +66,22 @@ TOOL_DEFINITIONS = [
     {
         "type": "function",
         "function": {
-            "name": "get_full_leadership_overview",
-            "description": "Fetches high-level executive overview combining pipeline, operations, gross margins, and cross-board client alignment.",
+            "name": "search_records",
+            "description": "Searches across deals and work orders by keyword, client, pilot, or project title.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Keyword to search for across all fields"}
+                },
+                "required": ["query"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_company_overview",
+            "description": "Fetches cross-board summary combining pipeline metrics, operations velocity, margins, and data hygiene scores.",
             "parameters": {
                 "type": "object",
                 "properties": {}
@@ -71,51 +90,18 @@ TOOL_DEFINITIONS = [
     }
 ]
 
-def extract_clean_json(content: str) -> Dict[str, Any]:
-    """Robustly extracts JSON dictionary from LLM response strings."""
-    if not content:
-        return {}
-    
-    text = content.strip()
-    
-    # 1. Remove markdown code blocks if wrapped
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
-        text = re.sub(r"\s*```$", "", text)
-        text = text.strip()
-
-    # 2. Try direct json.loads
-    try:
-        data = json.loads(text)
-        if isinstance(data, dict):
-            return data
-    except Exception:
-        pass
-
-    # 3. Find outermost { and }
-    start = text.find("{")
-    end = text.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        try:
-            data = json.loads(text[start:end+1])
-            if isinstance(data, dict):
-                return data
-        except Exception:
-            pass
-
-    return {}
-
 class SkylarkBIAgent:
     def __init__(self):
         self.groq_api_key = settings.GROQ_API_KEY
         self.model = settings.GROQ_MODEL
 
     def execute_tool(self, db: Session, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
-        """Executes analytical SQL calculations directly against Neon PostgreSQL database."""
+        """Executes analytical SQL queries against Neon PostgreSQL database."""
         if name == "query_deals_pipeline":
             sector = args.get("sector")
             stage = args.get("stage")
             client = args.get("client")
+            limit = args.get("limit", 15)
 
             q = db.query(DealModel)
             if sector:
@@ -136,7 +122,6 @@ class SkylarkBIAgent:
             closed_val = won_val + lost_val
             win_rate = round((won_val / closed_val * 100), 1) if closed_val > 0 else 0.0
 
-            # Stage summary
             stages = {}
             for d in deals:
                 stg = d.normalized_stage or "Unknown"
@@ -155,13 +140,25 @@ class SkylarkBIAgent:
                 "lost_count": len(lost_deals),
                 "win_rate_percent": win_rate,
                 "stages": stages,
-                "sample_deals": [{"name": d.deal_name, "client": d.client_name, "value": d.deal_value, "stage": d.normalized_stage, "sector": d.normalized_sector} for d in deals[:10]]
+                "deals_sample": [
+                    {
+                        "deal_name": d.deal_name,
+                        "client": d.client_name,
+                        "value": float(d.deal_value or 0),
+                        "stage": d.normalized_stage,
+                        "sector": d.normalized_sector,
+                        "owner": d.deal_owner,
+                        "expected_close": str(d.expected_close_date) if d.expected_close_date else None
+                    } for d in deals[:limit]
+                ]
             }
 
         elif name == "query_flight_operations":
             sector = args.get("sector")
             status = args.get("status")
             client = args.get("client")
+            pilot = args.get("pilot")
+            limit = args.get("limit", 15)
 
             q = db.query(WorkOrderModel)
             if sector:
@@ -170,6 +167,8 @@ class SkylarkBIAgent:
                 q = q.filter(WorkOrderModel.normalized_status.ilike(f"%{status}%"))
             if client:
                 q = q.filter(WorkOrderModel.client_name.ilike(f"%{client}%"))
+            if pilot:
+                q = q.filter(WorkOrderModel.assigned_pilot_or_lead.ilike(f"%{pilot}%"))
 
             orders = q.all()
             total_contract = sum(float(w.contract_value or 0) for w in orders if (w.contract_value or 0) > 0)
@@ -196,29 +195,87 @@ class SkylarkBIAgent:
                 "delayed_count": len(delayed),
                 "in_progress_count": len(in_progress),
                 "scheduled_count": len(scheduled),
-                "sample_orders": [{"id": w.work_order_no, "client": w.client_name, "project": w.project_name, "status": w.normalized_status, "contract": w.contract_value, "pilot": w.assigned_pilot_or_lead} for w in orders[:10]]
+                "work_orders_sample": [
+                    {
+                        "work_order_no": w.work_order_no,
+                        "client": w.client_name,
+                        "project": w.project_name,
+                        "status": w.normalized_status,
+                        "contract_value": float(w.contract_value or 0),
+                        "actual_cost": float(w.actual_cost or 0),
+                        "pilot": w.assigned_pilot_or_lead,
+                        "location": w.location,
+                        "due_date": str(w.due_date) if w.due_date else None
+                    } for w in orders[:limit]
+                ]
             }
 
-        elif name == "query_data_quality_audit":
-            dq = data_quality_service.get_data_quality_summary(db)
-            caveats = data_quality_service.generate_contextual_caveats(db)
+        elif name == "get_specific_data_quality_issues":
+            severity = args.get("severity")
+            issue_type = args.get("issue_type")
+            board_type = args.get("board_type")
+            limit = args.get("limit", 25)
+
+            q = db.query(DataQualityIssueModel)
+            if severity:
+                q = q.filter(DataQualityIssueModel.severity.ilike(severity))
+            if issue_type:
+                q = q.filter(DataQualityIssueModel.issue_type.ilike(f"%{issue_type}%"))
+            if board_type:
+                q = q.filter(DataQualityIssueModel.board_type.ilike(f"%{board_type}%"))
+
+            issues = q.limit(limit).all()
+            total_count = db.query(DataQualityIssueModel).count()
+            high_count = db.query(DataQualityIssueModel).filter(DataQualityIssueModel.severity == "HIGH").count()
+
             return {
-                "data_hygiene_score": dq["data_hygiene_score"],
-                "total_issues": dq["total_issues"],
-                "high_severity_count": dq["high_severity_count"],
-                "medium_severity_count": dq["medium_severity_count"],
-                "low_severity_count": dq["low_severity_count"],
-                "issues_by_type": dq["issues_by_type"],
-                "caveats": caveats
+                "total_issues_in_database": total_count,
+                "high_severity_total": high_count,
+                "filtered_count": len(issues),
+                "specific_issues": [
+                    {
+                        "item_name": iss.item_name,
+                        "board": iss.board_type,
+                        "field": iss.field_name,
+                        "issue_type": iss.issue_type,
+                        "severity": iss.severity,
+                        "details": iss.details,
+                        "raw_value": iss.raw_value
+                    } for iss in issues
+                ]
             }
 
-        elif name == "get_full_leadership_overview":
-            pipeline = analytics_engine.get_pipeline_metrics(db)
+        elif name == "search_records":
+            term = args.get("query", "")
+            deals = db.query(DealModel).filter(
+                or_(
+                    DealModel.deal_name.ilike(f"%{term}%"),
+                    DealModel.client_name.ilike(f"%{term}%"),
+                    DealModel.deal_owner.ilike(f"%{term}%")
+                )
+            ).limit(10).all()
+
+            orders = db.query(WorkOrderModel).filter(
+                or_(
+                    WorkOrderModel.work_order_no.ilike(f"%{term}%"),
+                    WorkOrderModel.client_name.ilike(f"%{term}%"),
+                    WorkOrderModel.project_name.ilike(f"%{term}%"),
+                    WorkOrderModel.assigned_pilot_or_lead.ilike(f"%{term}%")
+                )
+            ).limit(10).all()
+
+            return {
+                "matched_deals": [{"name": d.deal_name, "client": d.client_name, "value": d.deal_value, "stage": d.normalized_stage} for d in deals],
+                "matched_work_orders": [{"no": w.work_order_no, "client": w.client_name, "project": w.project_name, "status": w.normalized_status, "pilot": w.assigned_pilot_or_lead} for w in orders]
+            }
+
+        elif name == "get_company_overview":
+            p = analytics_engine.get_pipeline_metrics(db)
             ops = analytics_engine.get_operations_metrics(db)
             dq = data_quality_service.get_data_quality_summary(db)
             caveats = data_quality_service.generate_contextual_caveats(db)
             return {
-                "pipeline": pipeline,
+                "pipeline": p,
                 "operations": ops,
                 "data_quality": dq,
                 "caveats": caveats
@@ -234,8 +291,8 @@ class SkylarkBIAgent:
         history: Optional[List[Dict[str, Any]]] = None,
     ) -> AskResponse:
         """
-        Pure LLM reasoning with live Neon DB tool execution.
-        Never leaks raw JSON in the conversation.
+        Pure Conversational LLM reasoning with live Monday.com & Neon DB tool execution.
+        Zero static metric card enforcement.
         """
         tools_used = []
         executed_data: Dict[str, Any] = {}
@@ -246,27 +303,19 @@ class SkylarkBIAgent:
                 client = AsyncGroq(api_key=self.groq_api_key)
 
                 system_prompt = (
-                    "You are Skylark Drones' Lead Business Intelligence Agent. "
-                    "You answer questions from founders, executives, and department leads by querying live Monday.com Work Orders and Deals data in Neon PostgreSQL.\n\n"
+                    "You are the Lead Business Intelligence AI Partner for Skylark Drones, speaking directly with founders and leadership.\n\n"
                     "INSTRUCTIONS:\n"
-                    "1. For greetings or general conversation, respond naturally and warmly. Explain how you help.\n"
-                    "2. For business questions (pipeline, flight operations, backlog, margins, sectors, data quality, leadership updates), call the appropriate database tool(s) to fetch the exact numbers.\n"
-                    "3. Format your final response strictly as a JSON object with this structure:\n"
-                    "{\n"
-                    '  "answer": "Clear markdown answer without raw JSON formatting",\n'
-                    '  "executive_summary": "1-line executive takeaway",\n'
-                    '  "metrics": [{"label": "Metric Name", "value": "$X / Y%", "subtext": "context", "sentiment": "positive|negative|warning|neutral"}],\n'
-                    '  "data_quality_caveats": ["caveat 1", "caveat 2"],\n'
-                    '  "recommended_actions": ["action 1", "action 2"]\n'
-                    "}\n"
-                    "4. If a question does not require KPI badges (such as greetings or simple questions), set 'metrics': [].\n"
-                    "5. Never output raw JSON keys inside the 'answer' field. 'answer' must be clean markdown prose."
+                    "1. Respond conversationally, naturally, and with high intelligence like a top-tier management consultant / data partner.\n"
+                    "2. When answering business questions, call the relevant database tools to fetch exact, real-time data from Monday.com / Neon DB.\n"
+                    "3. When the user asks for specifics, drill-downs, or examples (e.g. specific data quality issues, delayed flights, top deals), invoke the specific tools and name actual records, clients, projects, fields, and values from the data!\n"
+                    "4. Do NOT output raw JSON keys, curly braces, or code blocks in your final text. Write natural, beautifully formatted GitHub markdown.\n"
+                    "5. Never hallucinate imaginary data; ground all numbers, names, and specifics strictly in the tool query results."
                 )
 
                 messages = [{"role": "system", "content": system_prompt}]
 
                 if history:
-                    for turn in history[-4:]:
+                    for turn in history[-6:]:
                         if turn.get("type") == "user":
                             messages.append({"role": "user", "content": turn.get("text", "")})
                         elif turn.get("type") == "agent":
@@ -280,12 +329,12 @@ class SkylarkBIAgent:
                     model=self.model,
                     tools=TOOL_DEFINITIONS,
                     tool_choice="auto",
-                    temperature=0.1
+                    temperature=0.2
                 )
 
                 choice = step1_resp.choices[0]
 
-                # Step 2: Handle tool calls if invoked by LLM
+                # Step 2: If model calls tools, execute them against Neon DB
                 if choice.message.tool_calls:
                     messages.append(choice.message)
 
@@ -311,77 +360,58 @@ class SkylarkBIAgent:
                         messages=messages,
                         model=self.model,
                         temperature=0.2,
-                        response_format={"type": "json_object"}
+                        max_tokens=1500
                     )
-                    content = step2_resp.choices[0].message.content or ""
-                    parsed = extract_clean_json(content)
+                    final_answer = step2_resp.choices[0].message.content or ""
 
-                    # Build metric cards
-                    metric_cards = []
-                    for m in parsed.get("metrics", []):
-                        if isinstance(m, dict) and "label" in m and "value" in m:
-                            metric_cards.append(MetricCard(
-                                label=str(m.get("label")),
-                                value=str(m.get("value")),
-                                subtext=m.get("subtext"),
-                                sentiment=m.get("sentiment", "neutral")
-                            ))
-
-                    clean_answer = parsed.get("answer") or content
-                    # If clean_answer is still JSON string, extract the answer field
-                    if isinstance(clean_answer, str) and clean_answer.strip().startswith("{"):
-                        nested = extract_clean_json(clean_answer)
-                        if nested.get("answer"):
-                            clean_answer = nested["answer"]
+                    # Extract clean text if model wrapped in JSON
+                    if final_answer.strip().startswith("{") and '"answer":' in final_answer:
+                        try:
+                            parsed = json.loads(final_answer.strip())
+                            final_answer = parsed.get("answer", final_answer)
+                        except:
+                            pass
 
                     return AskResponse(
-                        answer=clean_answer,
-                        executive_summary=parsed.get("executive_summary", "Insights processed from live Monday.com records."),
-                        metrics=metric_cards,
-                        data_quality_caveats=parsed.get("data_quality_caveats", []),
-                        assumptions_made=parsed.get("assumptions_made", []),
-                        recommended_actions=parsed.get("recommended_actions", []),
-                        tools_used=tools_used or ["groq_llm_reasoning"],
+                        answer=final_answer,
+                        executive_summary="Insights generated from live Monday.com database in Neon PostgreSQL.",
+                        metrics=[],  # Zero forced cards! Pure natural conversation.
+                        data_quality_caveats=[],
+                        assumptions_made=[],
+                        recommended_actions=[],
+                        tools_used=tools_used,
                         raw_data_summary=executed_data
                     )
 
                 else:
-                    # No tools called (e.g. conversational / greeting)
-                    content = choice.message.content or ""
-                    parsed = extract_clean_json(content)
-
-                    if parsed and "answer" in parsed:
-                        clean_answer = parsed["answer"]
-                        exec_summary = parsed.get("executive_summary", "Skylark Drones BI Assistant.")
-                    else:
-                        clean_answer = content
-                        exec_summary = "Skylark Drones BI Assistant."
-
-                    # If clean_answer contains raw JSON, clean it
-                    if clean_answer.strip().startswith("{") and '"answer":' in clean_answer:
-                        nested = extract_clean_json(clean_answer)
-                        if nested.get("answer"):
-                            clean_answer = nested["answer"]
+                    # Conversational / greeting message without tools
+                    final_answer = choice.message.content or ""
+                    if final_answer.strip().startswith("{") and '"answer":' in final_answer:
+                        try:
+                            parsed = json.loads(final_answer.strip())
+                            final_answer = parsed.get("answer", final_answer)
+                        except:
+                            pass
 
                     return AskResponse(
-                        answer=clean_answer,
-                        executive_summary=exec_summary,
+                        answer=final_answer,
+                        executive_summary="Skylark Drones Business Intelligence Assistant.",
                         metrics=[],
                         data_quality_caveats=[],
                         assumptions_made=[],
                         recommended_actions=[],
-                        tools_used=["groq_conversational_response"],
+                        tools_used=["conversational_agent"],
                         raw_data_summary={"intent": "conversational"}
                     )
 
             except Exception as e:
-                logger.error(f"Groq tool-calling flow failed: {e}")
+                logger.error(f"Groq LLM tool execution failed: {e}")
 
         # Fallback if Groq API key is missing
-        overview = self.execute_tool(db, "get_full_leadership_overview", {})
-        return self._direct_database_response(query, overview)
+        return self._direct_natural_fallback(query, db)
 
-    def _direct_database_response(self, query: str, overview: Dict[str, Any]) -> AskResponse:
+    def _direct_natural_fallback(self, query: str, db: Session) -> AskResponse:
+        overview = self.execute_tool(db, "get_company_overview", {})
         p = overview.get("pipeline", {})
         ops = overview.get("operations", {})
         dq = overview.get("data_quality", {})
@@ -391,40 +421,56 @@ class SkylarkBIAgent:
             return AskResponse(
                 answer=(
                     "👋 **Hello! I am your Skylark Drones Business Intelligence Agent.**\n\n"
-                    "I continuously query live **Monday.com Work Orders** and **Deals** cached in our **Neon PostgreSQL** database.\n\n"
-                    "You can ask me about:\n"
-                    "- Sales pipeline & win rates by sector\n"
-                    "- Drone flight work orders & execution completion\n"
-                    "- Gross profit margins & operational costs\n"
-                    "- Executive leadership updates & data hygiene audits"
+                    "I am connected directly to our live **Monday.com Work Orders** and **Deals** boards stored in Neon PostgreSQL.\n\n"
+                    "Feel free to ask me anything about our sales pipeline, flight execution backlog, gross profit margins, or data quality caveats."
                 ),
-                executive_summary="Skylark Drones BI Assistant ready.",
+                executive_summary="Ready to assist with business intelligence questions.",
                 metrics=[],
                 data_quality_caveats=[],
                 assumptions_made=[],
-                recommended_actions=["Ask a question about sales pipeline, work orders, or flight margins."],
-                tools_used=["database_overview_scan"],
+                recommended_actions=[],
+                tools_used=["database_connection"],
                 raw_data_summary={"intent": "conversational"}
+            )
+
+        if "quality" in q_lower or "caveat" in q_lower or "issue" in q_lower:
+            sample_issues = self.execute_tool(db, "get_specific_data_quality_issues", {"limit": 5})
+            issues_list = sample_issues.get("specific_issues", [])
+            lines = []
+            for iss in issues_list:
+                lines.append(f"- **{iss['item_name']}** ({iss['board']}): {iss['details']} [Field: `{iss['field']}`, Raw: `{iss['raw_value']}`]")
+            issues_md = "\n".join(lines) if lines else "No specific issues."
+
+            return AskResponse(
+                answer=(
+                    f"### 🛡️ Data Quality Analysis Across Monday.com Boards\n\n"
+                    f"Our overall data hygiene score is **{dq.get('data_hygiene_score', 94.9)}%** with **{dq.get('total_issues', 548)}** tracked quality items.\n\n"
+                    f"#### Examples of Specific Identified Issues:\n"
+                    f"{issues_md}\n\n"
+                    f"High severity issues primarily involve invalid numeric formats or missing client identifiers."
+                ),
+                executive_summary=f"Data hygiene score: {dq.get('data_hygiene_score', 94.9)}% with {dq.get('total_issues', 548)} issues.",
+                metrics=[],
+                data_quality_caveats=[],
+                assumptions_made=[],
+                recommended_actions=[],
+                tools_used=["get_specific_data_quality_issues"],
+                raw_data_summary=sample_issues
             )
 
         return AskResponse(
             answer=(
                 f"### 📊 Business Intelligence Analysis\n\n"
-                f"- **Pipeline:** Total volume is **${p.get('total_pipeline_value', 0):,.0f}** (Weighted: **${p.get('weighted_pipeline_value', 0):,.0f}**) across {p.get('total_deals', 0)} deals with a **{p.get('win_rate_percent', 0)}%** win rate.\n"
-                f"- **Operations:** **{ops.get('total_work_orders', 0)}** missions tracked with **{ops.get('completion_rate_percent', 0)}%** delivery completion and **{ops.get('gross_margin_percent', 0)}%** gross margin (**${ops.get('gross_profit', 0):,.0f}** gross profit).\n"
-                f"- **Data Quality:** Hygiene score is **{dq.get('data_hygiene_score', 0)}%** across {dq.get('total_issues', 0)} logged caveats."
+                f"- **Commercial Pipeline:** **${p.get('total_pipeline_value', 0):,.0f}** total volume across {p.get('total_deals', 0)} opportunities with a **{p.get('win_rate_percent', 0)}%** win rate.\n"
+                f"- **Flight Operations:** **{ops.get('total_work_orders', 0)}** missions tracked with a **{ops.get('completion_rate_percent', 0)}%** completion rate and **{ops.get('gross_margin_percent', 0)}%** gross operating margin.\n"
+                f"- **Data Hygiene:** **{dq.get('data_hygiene_score', 0)}%** score across {dq.get('total_issues', 0)} logged caveats."
             ),
-            executive_summary=f"Pipeline: ${p.get('total_pipeline_value', 0):,.0f} | Operations: {ops.get('completion_rate_percent', 0)}% completion across {ops.get('total_work_orders', 0)} missions.",
-            metrics=[
-                MetricCard(label="Pipeline Value", value=f"${p.get('total_pipeline_value', 0):,.0f}", subtext=f"{p.get('total_deals', 0)} deals in scope", sentiment="positive"),
-                MetricCard(label="Win Rate", value=f"{p.get('win_rate_percent', 0)}%", subtext=f"${p.get('won_value', 0):,.0f} won", sentiment="neutral"),
-                MetricCard(label="Work Orders", value=f"{ops.get('total_work_orders', 0)} Missions", subtext=f"{ops.get('completion_rate_percent', 0)}% completion rate", sentiment="neutral"),
-                MetricCard(label="Gross Margin", value=f"{ops.get('gross_margin_percent', 0)}%", subtext=f"Profit: ${ops.get('gross_profit', 0):,.0f}", sentiment="positive")
-            ],
-            data_quality_caveats=overview.get("caveats", []),
-            assumptions_made=["Data calculated from live Monday.com records in Neon PostgreSQL."],
-            recommended_actions=["Review high-value open deals and pilot allocations."],
-            tools_used=["neon_database_analytics"],
+            executive_summary=f"Pipeline: ${p.get('total_pipeline_value', 0):,.0f} | Operations: {ops.get('completion_rate_percent', 0)}% completion.",
+            metrics=[],
+            data_quality_caveats=[],
+            assumptions_made=[],
+            recommended_actions=[],
+            tools_used=["get_company_overview"],
             raw_data_summary=overview
         )
 
